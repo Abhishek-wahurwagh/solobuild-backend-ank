@@ -6,8 +6,8 @@ from app.core.config import settings
 from app.core.database import engine
 
 from app.domains.auth.router import router as auth_router
-"""
 from app.domains.agents.router import router as agents_router
+"""
 from app.domains.campaigns.router import router as campaigns_router
 from app.domains.telephony.router import router as telephony_router
 from app.domains.analytics.router import router as analytics_router
@@ -38,8 +38,8 @@ app = FastAPI(
 
 # Register Domain Routers under /api/v1
 app.include_router(auth_router, prefix="/api/v1", tags=["Auth"])
-"""
 app.include_router(agents_router, prefix="/api/v1/agents", tags=["Agents"])
+"""
 app.include_router(campaigns_router, prefix="/api/v1/campaigns", tags=["Campaigns"])
 app.include_router(telephony_router, prefix="/api/v1/telephony", tags=["Telephony"])
 app.include_router(analytics_router, prefix="/api/v1/analytics", tags=["Analytics"])
