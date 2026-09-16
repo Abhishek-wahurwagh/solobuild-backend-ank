@@ -1,46 +1,77 @@
 from typing import Any
 from pydantic import BaseModel, ConfigDict
-from app.domains.campaigns.models import EmploymentType, CandidateStatus
+from app.domains.campaigns.models import WorkflowStepStatus
 from uuid import UUID
 from datetime import datetime
 
 
-class CandidateResponse(BaseModel):
-    """Returned when fetching candidate list."""
+class WorkflowTemplateResponse(BaseModel):
+    id: UUID
+    template: dict
+    created_at: datetime
     model_config = ConfigDict(from_attributes=True)
 
+
+class CampaignCreate(BaseModel):
+    title: str
+    workflow_template_id: UUID | None = None
+    agent_id: UUID | None = None
+    raw_text: str | None = None
+    extracted_fields: dict | None = None
+
+
+class CampaignResponse(BaseModel):
+    id: UUID
+    title: str
+    workflow_template_id: UUID | None
+    agent_id: UUID | None
+    raw_text: str | None
+    extracted_fields: dict | None
+    created_at: datetime
+    updated_at: datetime
+    model_config = ConfigDict(from_attributes=True)
+
+
+class CandidateResponse(BaseModel):
     id: UUID
     campaign_id: UUID
     name: str | None = None
     email: str | None = None
     phone: str | None = None
-    location: str | None = None
-    experience_years: int | None = None
-    skills: list[str] = []
-    status: CandidateStatus
+    
+    workflow_step: str | None = None
+    step_status: WorkflowStepStatus
     created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
 
 
-class BatchUploadResponse(BaseModel):
-    """Returned by POST /campaigns/{campaign_id}/candidates/upload"""
-    batch_id: str
-    status: str = "QUEUED"
-    accepted_files: int
 
+class DocumentScreeningResponse(BaseModel):
+    id: UUID
+    match_score: float | None
+    matched_fields: dict | None
+    unmatched_fields: dict | None
+    summary: str | None
+    model_config = ConfigDict(from_attributes=True)
 
-class BatchStatusResponse(BaseModel):
-    """Returned by GET /campaigns/{campaign_id}/candidates/upload/{batch_id}/status"""
-    batch_id: str
+class CallScreeningResponse(BaseModel):
+    id: UUID
+    transcript: str | None
+    recording_url: str | None
+    match_score: float | None
+    matched_fields: dict | None
+    unmatched_fields: dict | None
+    summary: str | None
+    model_config = ConfigDict(from_attributes=True)
+
+class WorkflowEventLogResponse(BaseModel):
+    id: UUID
+    campaign_id: UUID
+    candidate_id: UUID
+    service_name: str
     status: str
-    total_files: int
-    processed: int
-    failed: int
-    created_at: str | None = None
-    updated_at: str | None = None
-    finished_at: str | None = None
-    candidates: list[CandidateResponse] | None = None
-
-
-class ScreeningRequest(BaseModel):
-    """Payload for POST /campaigns/{campaign_id}/candidates/screen"""
-    candidate_ids: list[UUID] | None = None
+    payload: dict | None
+    created_at: datetime
+    model_config = ConfigDict(from_attributes=True)
