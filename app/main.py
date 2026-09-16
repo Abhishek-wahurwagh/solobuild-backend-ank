@@ -4,11 +4,12 @@ from sqlalchemy import text
 
 from app.core.config import settings
 from app.core.database import engine
+from app.core.redis import get_redis_pool, close_redis_pool
 
 from app.domains.auth.router import router as auth_router
 from app.domains.agents.router import router as agents_router
-"""
 from app.domains.campaigns.router import router as campaigns_router
+"""
 from app.domains.telephony.router import router as telephony_router
 from app.domains.analytics.router import router as analytics_router
 """
@@ -16,6 +17,7 @@ from app.domains.analytics.router import router as analytics_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # -- Startup --
     try:
         async with engine.begin() as conn:
             await conn.execute(text("SELECT 1;"))
@@ -23,11 +25,21 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"❌ Failed to connect to Database: {e}")
 
+    # Warm the Redis connection pool
+    try:
+        redis = await get_redis_pool()
+        await redis.ping()
+        await redis.aclose()
+        print("✅ Redis connection established successfully.")
+    except Exception as e:
+        print(f"⚠️  Redis not available (workers may fail): {e}")
+
     yield
 
-    # Shutdown logic
+    # -- Shutdown --
+    await close_redis_pool()
     await engine.dispose()
-    print("🔌 Database engine connections closed.")
+    print("🔌 Database & Redis connections closed.")
 
 
 app = FastAPI(
@@ -38,11 +50,11 @@ app = FastAPI(
 
 # Register Domain Routers under /api/v1
 app.include_router(auth_router, prefix="/api/v1", tags=["Auth"])
-app.include_router(agents_router, prefix="/api/v1/agents", tags=["Agents"])
+app.include_router(agents_router, prefix="/api/v1", tags=["Agents"])
+app.include_router(campaigns_router, prefix="/api/v1", tags=["Campaigns"])
 """
-app.include_router(campaigns_router, prefix="/api/v1/campaigns", tags=["Campaigns"])
-app.include_router(telephony_router, prefix="/api/v1/telephony", tags=["Telephony"])
-app.include_router(analytics_router, prefix="/api/v1/analytics", tags=["Analytics"])
+app.include_router(telephony_router, prefix="/api/v1", tags=["Telephony"])
+app.include_router(analytics_router, prefix="/api/v1", tags=["Analytics"])
 """
 
 # Root & Health Check Endpoints

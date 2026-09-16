@@ -22,6 +22,20 @@ class Settings(BaseSettings):
     AWS_SECRET_ACCESS_KEY: str = ""
     AWS_REGION: str = ""
 
+    AI_EMBEDDING_PROVIDER: str = "gemini"
+    OPENAI_API_KEY: str = ""
+    OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small"
+    GEMINI_API_KEY: str = "your-gemini-key"
+    GEMINI_EMBEDDING_MODEL: str = "models/text-embedding-004"
+    GEMINI_EXTRACTION_MODEL: str = "gemini-1.5-flash"
+
+    # Redis
+    REDIS_URL: str = "redis://localhost:6379"
+
+    # Resume pipeline
+    RESUME_MAX_FILE_COUNT: int = 500
+    PRE_SCREEN_MATCH_THRESHOLD: float = 0.4
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
