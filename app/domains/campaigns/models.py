@@ -38,7 +38,7 @@ class Campaign(Base):
     agent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("agents.id"), nullable=True, index=True)
     
     raw_text: Mapped[str] = mapped_column(Text, nullable=True)
-    extracted_fields: Mapped[dict] = mapped_column(JSONB, nullable=True, default=dict)
+    required_fields: Mapped[dict] = mapped_column(JSONB, nullable=True, default=dict)
     file_url: Mapped[str] = mapped_column(Text, nullable=True)
     
     created_by_user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True)
@@ -56,6 +56,7 @@ class Candidate(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=True)
     email: Mapped[str] = mapped_column(String(255), nullable=True)
     phone: Mapped[str] = mapped_column(String(50), nullable=True)
+    extracted_fields: Mapped[dict] = mapped_column(JSONB, nullable=True, default=dict)
     
     workflow_step: Mapped[str] = mapped_column(String(255), nullable=True)
     step_status: Mapped[WorkflowStepStatus] = mapped_column(Enum(WorkflowStepStatus), default=WorkflowStepStatus.PENDING, nullable=False)

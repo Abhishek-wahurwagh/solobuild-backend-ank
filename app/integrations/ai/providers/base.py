@@ -2,31 +2,25 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 
-class EmbeddingProvider(ABC):
-    @abstractmethod
-    async def embed(self, text: str) -> list[float]:
-        """
-        Return a vector of length 384, or a provider-specific embedding vector.
-        """
-        raise NotImplementedError
-
-
 class StructuredExtractionProvider(ABC):
     @abstractmethod
-    async def extract(self, jd_text: str) -> dict[str, Any]:
+    async def extract(self, document_text: str, existing_fields: dict | None = None) -> dict[str, Any]:
         """
-        Return a lightweight metadata payload for a JD such as
-        {experience_required, skills_required}.
-
-        Keep the extraction contract intentionally narrow because the
-        point of this pass is only to prefilter bootstrapping data cheaply.
+        Extract fields from a generic document.
+        If existing_fields is provided, retain them and append new fields extracted from the document.
         """
         raise NotImplementedError
 
     @abstractmethod
-    async def screen_candidate(self, prompt: str) -> dict[str, Any]:
+    async def screen_candidate(
+        self, 
+        candidate_text: str, 
+        candidate_fields: dict, 
+        campaign_text: str, 
+        campaign_fields: dict
+    ) -> dict[str, Any]:
         """
-        Return candidate screening payload such as
-        {match_score, one_line_summary, matched_skills, missing_skills}.
+        Return candidate screening payload based on generic fields and text:
+        {match_score, one_line_summary, matched_fields, unmatched_fields}.
         """
-        raise NotImplementedError
+        raise NotImplementedError

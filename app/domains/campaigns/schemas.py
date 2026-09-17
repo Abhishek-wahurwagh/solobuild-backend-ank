@@ -17,7 +17,7 @@ class CampaignCreate(BaseModel):
     workflow_template_id: UUID | None = None
     agent_id: UUID | None = None
     raw_text: str | None = None
-    extracted_fields: dict | None = None
+    required_fields: dict | None = None
 
 
 class CampaignResponse(BaseModel):
@@ -26,7 +26,7 @@ class CampaignResponse(BaseModel):
     workflow_template_id: UUID | None
     agent_id: UUID | None
     raw_text: str | None
-    extracted_fields: dict | None
+    required_fields: dict | None
     created_at: datetime
     updated_at: datetime
     model_config = ConfigDict(from_attributes=True)
@@ -38,6 +38,7 @@ class CandidateResponse(BaseModel):
     name: str | None = None
     email: str | None = None
     phone: str | None = None
+    extracted_fields: dict | None = None
     
     workflow_step: str | None = None
     step_status: WorkflowStepStatus

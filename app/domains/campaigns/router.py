@@ -9,33 +9,28 @@ from fastapi import (
     HTTPException,
     UploadFile,
     status,
+    Body,
 )
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from uuid6 import uuid7
 
-from fastapi import File, UploadFile
-
 from app.core.database import get_db
 from app.core.redis import get_redis_pool
 from app.domains.auth.dependencies import get_current_user
 from app.domains.campaigns.models import (
-    HiringCampaign,
-    CampaignStatus,
-    EmploymentType,
+    Campaign,
+    Candidate,
+    WorkflowStepStatus,
 )
-from app.domains.campaigns.schemas import BatchStatusResponse, BatchUploadResponse
+from app.domains.campaigns.schemas import BatchStatusResponse, BatchUploadResponse, CampaignResponse, CandidateResponse, ScreeningRequest
 from app.domains.campaigns.service import (
-    CampaignService,
     create_batch_tracker,
-    enqueue_resume_upload_batch,
+    enqueue_document_upload_batch,
     enqueue_campaign_screening,
     get_batch_status,
     stage_files_to_s3,
-    validate_jd_file,
-    extract_jd_from_upload,
-    normalize_jd_text,
-    validate_resume_uploads,
+    validate_document_uploads,
 )
 from app.domains.users.models import User
 
@@ -46,59 +41,90 @@ router = APIRouter(prefix="/campaigns")
 # Campaign CRUD
 # -----------------------------------------------------------------------
 
-@router.post("/", status_code=status.HTTP_201_CREATED)
+@router.post("/", status_code=status.HTTP_201_CREATED, response_model=CampaignResponse)
 async def create_campaign(
-    job_title: str = Form(...),
-    location: str | None = Form(None),
-    employment_type: EmploymentType = Form(EmploymentType.FULL_TIME),
-    role_summary: str | None = Form(None),
-    jd_text: str | None = Form(None),
-    jd_file: UploadFile | None = File(None),
+    title: str = Form(...),
+    raw_text: str | None = Form(None),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    if jd_text is None and jd_file is None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Either jd_text or jd_file must be provided.",
-        )
-
-    if jd_text is not None and jd_file is not None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Provide either jd_text or jd_file, not both.",
-        )
-
-    source_jd_text = jd_text
-
-    if jd_file is not None:
-        validate_jd_file(jd_file)
-        source_jd_text = await extract_jd_from_upload(jd_file)
-
-    if source_jd_text is None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="JD text is required after parsing the upload.",
-        )
-
-    source_jd_text = normalize_jd_text(source_jd_text)
-
-    campaign = await CampaignService.create_campaign(
-        db=db,
-        job_title=job_title,
-        location=location,
-        employment_type=employment_type,
-        role_summary=role_summary,
-        jd_text=source_jd_text,
-        user_id=current_user.id,
+    campaign = Campaign(
+        title=title,
+        raw_text=raw_text,
+        created_by_user_id=current_user.id,
     )
+    db.add(campaign)
+    await db.commit()
+    await db.refresh(campaign)
+    return campaign
 
+
+@router.patch("/{campaign_id}", response_model=CampaignResponse)
+async def update_campaign(
+    campaign_id: UUID,
+    raw_text: str | None = Body(None),
+    required_fields: dict | None = Body(None),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(Campaign).where(
+            Campaign.id == campaign_id,
+            Campaign.created_by_user_id == current_user.id,
+        )
+    )
+    campaign = result.scalar_one_or_none()
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    if raw_text is not None:
+        campaign.raw_text = raw_text
+    if required_fields is not None:
+        campaign.required_fields = required_fields
+
+    await db.commit()
+    await db.refresh(campaign)
     return campaign
 
 
 # -----------------------------------------------------------------------
-# Candidate Resume Upload
+# Candidate CRUD & Upload
 # -----------------------------------------------------------------------
+
+@router.patch("/{campaign_id}/candidates/{candidate_id}", response_model=CandidateResponse)
+async def update_candidate(
+    campaign_id: UUID,
+    candidate_id: UUID,
+    name: str | None = Body(None),
+    email: str | None = Body(None),
+    phone: str | None = Body(None),
+    extracted_fields: dict | None = Body(None),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(Candidate).where(
+            Candidate.id == candidate_id,
+            Candidate.campaign_id == campaign_id,
+        )
+    )
+    candidate = result.scalar_one_or_none()
+    if not candidate:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+
+    if name is not None:
+        candidate.name = name
+    if email is not None:
+        candidate.email = email
+    if phone is not None:
+        candidate.phone = phone
+    if extracted_fields is not None:
+        candidate.extracted_fields = extracted_fields
+
+    await db.commit()
+    await db.refresh(candidate)
+    return candidate
+
 
 @router.post(
     "/{campaign_id}/candidates/upload",
@@ -107,47 +133,28 @@ async def create_campaign(
 )
 async def upload_candidates(
     campaign_id: UUID,
-    files: list[UploadFile] = File(..., description="One or more resume files (PDF, DOCX, TXT) or a single ZIP file"),
+    files: list[UploadFile] = File(...),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Accept one or more resume files (or a single zip) for async processing.
-
-    Returns a ``batch_id`` immediately.  Processing happens in the background
-    worker — poll the status endpoint to track progress.
-    """
-
-    # 1. Verify campaign exists and belongs to this user
     result = await db.execute(
-        select(HiringCampaign).where(
-            HiringCampaign.id == campaign_id,
-            HiringCampaign.user_id == current_user.id,
+        select(Campaign).where(
+            Campaign.id == campaign_id,
+            Campaign.created_by_user_id == current_user.id,
         )
     )
     campaign = result.scalar_one_or_none()
     if campaign is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Campaign not found.",
-        )
+        raise HTTPException(status_code=404, detail="Campaign not found.")
 
-    # 2. Validate uploads (extension + MIME + zip safety is deferred to worker)
-    validate_resume_uploads(files)
-
-    # 3. Generate batch ID
+    validate_document_uploads(files)
     batch_id = f"batch_{uuid7()}"
-
-    # 4. Stage files to S3
     s3_prefix, source_type = await stage_files_to_s3(batch_id, files)
 
-    # 5. Create Redis batch tracker
     redis = await get_redis_pool()
     try:
         await create_batch_tracker(redis, batch_id, file_count=len(files))
-
-        # 6. Enqueue the background job
-        from app.domains.campaigns.service import enqueue_resume_upload_batch
-        await enqueue_resume_upload_batch(
+        await enqueue_document_upload_batch(
             redis,
             batch_id=batch_id,
             campaign_id=str(campaign_id),
@@ -164,10 +171,6 @@ async def upload_candidates(
     )
 
 
-# -----------------------------------------------------------------------
-# Batch Status Polling
-# -----------------------------------------------------------------------
-
 @router.get(
     "/{campaign_id}/candidates/upload/{batch_id}/status",
     response_model=BatchStatusResponse,
@@ -178,11 +181,6 @@ async def batch_status(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Poll the processing status of a resume upload batch.
-    
-    When COMPLETED, returns the list of parsed candidates.
-    """
-
     redis = await get_redis_pool()
     try:
         data = await get_batch_status(redis, batch_id)
@@ -190,21 +188,16 @@ async def batch_status(
         await redis.aclose()
 
     if data is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Batch not found.",
-        )
+        raise HTTPException(status_code=404, detail="Batch not found.")
 
     status_val = data.get("status", "UNKNOWN")
     candidates = None
 
     if status_val == "COMPLETED":
-        # Fetch parsed candidates for this campaign
-        from app.domains.campaigns.models import Candidate, CandidateStatus
         result = await db.execute(
             select(Candidate).where(
                 Candidate.campaign_id == campaign_id,
-                Candidate.status == CandidateStatus.RESUME_PARSED
+                Candidate.workflow_step == "document_extraction"
             )
         )
         candidates = result.scalars().all()
@@ -223,10 +216,8 @@ async def batch_status(
 
 
 # -----------------------------------------------------------------------
-# Candidate Management & Screening
+# Candidate Screening
 # -----------------------------------------------------------------------
-
-from app.domains.campaigns.schemas import CandidateResponse, ScreeningRequest
 
 @router.get(
     "/{campaign_id}/candidates",
@@ -237,9 +228,6 @@ async def get_candidates(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Fetch all candidates for a campaign."""
-    from app.domains.campaigns.models import Candidate
-    
     result = await db.execute(
         select(Candidate).where(Candidate.campaign_id == campaign_id)
     )
@@ -257,32 +245,19 @@ async def screen_candidates(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Trigger the screening phase for the specified candidates."""
-    # 1. Verify campaign exists and belongs to this user
     result = await db.execute(
-        select(HiringCampaign).where(
-            HiringCampaign.id == campaign_id,
-            HiringCampaign.user_id == current_user.id,
+        select(Campaign).where(
+            Campaign.id == campaign_id,
+            Campaign.created_by_user_id == current_user.id,
         )
     )
     if not result.scalar_one_or_none():
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Campaign not found.",
-        )
+        raise HTTPException(status_code=404, detail="Campaign not found.")
 
-    # 2. Generate batch ID for screening progress
     batch_id = f"screen_{uuid7()}"
-
-    # 3. Create Redis batch tracker (estimate file count as 0 initially, worker updates it)
     redis = await get_redis_pool()
     try:
         await create_batch_tracker(redis, batch_id, file_count=0)
-
-        # 4. Enqueue the screening job
-        from app.domains.campaigns.service import enqueue_campaign_screening
-        
-        # Convert UUIDs to strings for arq JSON serialization
         candidate_ids_str = [str(cid) for cid in request.candidate_ids] if request.candidate_ids else None
         
         await enqueue_campaign_screening(
@@ -310,7 +285,6 @@ async def screening_batch_status(
     batch_id: str,
     current_user: User = Depends(get_current_user),
 ):
-    """Poll the processing status of a screening batch."""
     redis = await get_redis_pool()
     try:
         data = await get_batch_status(redis, batch_id)
@@ -318,10 +292,7 @@ async def screening_batch_status(
         await redis.aclose()
 
     if data is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Batch not found.",
-        )
+        raise HTTPException(status_code=404, detail="Batch not found.")
 
     return BatchStatusResponse(
         batch_id=batch_id,
