@@ -304,3 +304,21 @@ async def screening_batch_status(
         updated_at=data.get("updated_at"),
         finished_at=data.get("finished_at"),
     )
+
+# -----------------------------------------------------------------------
+# Webhooks
+# -----------------------------------------------------------------------
+
+from app.domains.campaigns.schemas import CallWebhookPayload
+from app.domains.campaigns.service import process_call_webhook
+
+@router.post("/webhooks/call-completed", status_code=status.HTTP_200_OK)
+async def call_completed_webhook(
+    payload: CallWebhookPayload,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Webhook endpoint to receive call completion data from Voice Provider (e.g. Vobiz).
+    """
+    await process_call_webhook(db, payload)
+    return {"status": "ok"}

@@ -23,8 +23,6 @@ class Settings(BaseSettings):
     AWS_REGION: str = ""
 
     AI_EMBEDDING_PROVIDER: str = "gemini"
-    OPENAI_API_KEY: str = ""
-    OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small"
     GEMINI_API_KEY: str = "your-gemini-key"
     GEMINI_EMBEDDING_MODEL: str = "models/text-embedding-004"
     GEMINI_EXTRACTION_MODEL: str = "gemini-1.5-flash"
@@ -32,9 +30,13 @@ class Settings(BaseSettings):
     # Redis
     REDIS_URL: str = "redis://localhost:6379"
 
+    # Voice & Telephony
+    VOICE_PROVIDER: str = "mock"
+    VOBIZ_API_KEY: str = ""
+    PIPECAT_WEBHOOK_URL: str = ""
+
     # Resume pipeline
     RESUME_MAX_FILE_COUNT: int = 500
-    PRE_SCREEN_MATCH_THRESHOLD: float = 0.4
 
     model_config = SettingsConfigDict(
         env_file=".env",

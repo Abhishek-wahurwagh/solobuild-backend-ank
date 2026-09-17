@@ -388,3 +388,87 @@ async def screen_document_llm(
         campaign_text="",
         campaign_fields=campaign_fields or {},
     )
+
+# =========================================================================
+# WEBHOOK PROCESSING
+# =========================================================================
+
+from app.domains.campaigns.schemas import CallWebhookPayload
+from app.domains.campaigns.models import CallScreening, Candidate, Campaign
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+async def process_call_webhook(db: AsyncSession, payload: CallWebhookPayload) -> None:
+    # 1. Fetch Candidate and Campaign
+    result = await db.execute(
+        select(Candidate).where(Candidate.id == payload.candidate_id)
+    )
+    candidate = result.scalar_one_or_none()
+    if not candidate:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+        
+    result = await db.execute(
+        select(Campaign).where(Campaign.id == payload.campaign_id)
+    )
+    campaign = result.scalar_one_or_none()
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    # 2. Extract Data from Transcript & Screen using Generic Engine
+    extraction_provider = StructuredExtractionProviderFactory.build()
+    
+    transcript = payload.transcript or ""
+    
+    # We pass existing fields so the LLM has context, but we instruct it 
+    # to extract new fields or updated info.
+    extracted_fields = await extraction_provider.extract(transcript, candidate.extracted_fields)
+    
+    # Screen Candidate based on the new transcript + fields vs campaign requirements
+    screening_result = await extraction_provider.screen_candidate(
+        candidate_text=transcript,
+        candidate_fields=extracted_fields,
+        campaign_text=campaign.raw_text or "",
+        campaign_fields=campaign.required_fields or {},
+    )
+    
+    # 3. Create CallScreening record
+    call_screening = CallScreening(
+        campaign_id=campaign.id,
+        candidate_id=candidate.id,
+        transcript=transcript,
+        recording_url=payload.recording_url,
+        match_score=screening_result.get("match_score", 0.0),
+        matched_fields=screening_result.get("matched_fields", {}),
+        unmatched_fields=screening_result.get("unmatched_fields", {}),
+        summary=screening_result.get("summary", ""),
+    )
+    db.add(call_screening)
+    
+    # 4. Update Candidate Fields
+    # The rule is: data extracted from the direct phone call overwrites existing fields.
+    merged_fields = dict(candidate.extracted_fields or {})
+    merged_fields.update(extracted_fields)
+    candidate.extracted_fields = merged_fields
+    
+    # If the LLM returned primary fields, update them
+    if "name" in extracted_fields and extracted_fields["name"]:
+        candidate.name = extracted_fields["name"]
+    if "email" in extracted_fields and extracted_fields["email"]:
+        candidate.email = extracted_fields["email"]
+    if "phone" in extracted_fields and extracted_fields["phone"]:
+        candidate.phone = extracted_fields["phone"]
+        
+    await db.commit()
+    
+    # 5. Notify Orchestrator to proceed to next step
+    from app.domains.campaigns.orchestrator import on_step_completed
+    await on_step_completed(
+        db=db,
+        candidate_id=candidate.id,
+        service_name="outbound_call",
+        payload={
+            "call_id": payload.call_id,
+            "status": payload.status,
+            "match_score": call_screening.match_score,
+        }
+    )

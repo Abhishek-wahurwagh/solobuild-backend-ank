@@ -232,3 +232,80 @@ async def screen_campaign_candidates(
         return {"batch_id": batch_id, "status": "FAILED", "reason": str(exc)}
     finally:
         await redis.aclose()
+
+
+async def task_initiate_outbound_call(
+    ctx: dict[str, Any],
+    candidate_id: UUID,
+) -> dict[str, Any]:
+    from app.integrations.voice.factory import VoiceFactory
+    
+    redis = await get_redis_pool()
+    try:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(select(Candidate).where(Candidate.id == candidate_id))
+            candidate = result.scalar_one_or_none()
+            if not candidate:
+                logger.error(f"Candidate {candidate_id} not found.")
+                return {"status": "FAILED", "reason": "Candidate not found"}
+
+            result = await db.execute(select(Campaign).where(Campaign.id == candidate.campaign_id))
+            campaign = result.scalar_one_or_none()
+            if not campaign:
+                return {"status": "FAILED", "reason": "Campaign not found"}
+
+            # Concurrency check (simplistic: check count of candidates in IN_PROGRESS for this campaign)
+            from sqlalchemy import func
+            count_result = await db.execute(
+                select(func.count(Candidate.id)).where(
+                    Candidate.campaign_id == campaign.id,
+                    Candidate.step_status == WorkflowStepStatus.IN_PROGRESS,
+                    Candidate.workflow_step == "outbound_call"
+                )
+            )
+            active_calls = count_result.scalar_one_or_none() or 0
+            
+            # Use campaign setting or default to 3 concurrent calls
+            max_concurrent = 3
+            if active_calls >= max_concurrent:
+                logger.info(f"Campaign {campaign.id} reached max concurrent calls ({active_calls}/{max_concurrent}). Delaying candidate {candidate_id}.")
+                # Reschedule the task for later (e.g. 1 minute)
+                from arq import Retry
+                raise Retry(defer=60)
+
+            # Change status to IN_PROGRESS
+            candidate.step_status = WorkflowStepStatus.IN_PROGRESS
+            candidate.workflow_step = "outbound_call"
+            await db.commit()
+
+            # Trigger the call
+            provider = VoiceFactory.get_provider()
+            
+            # Simple context generation from required_fields and raw_text
+            system_prompt = f"Objective: Conduct an interview.\nRequirements: {campaign.required_fields}\nContext: {campaign.raw_text}"
+            phone = candidate.phone or ""
+            
+            if not phone:
+                candidate.step_status = WorkflowStepStatus.FAILED
+                await db.commit()
+                return {"status": "FAILED", "reason": "Candidate has no phone number"}
+                
+            call_id = await provider.initiate_call(
+                candidate_phone=phone,
+                candidate_id=candidate.id,
+                campaign_id=campaign.id,
+                system_prompt=system_prompt,
+            )
+            
+            return {"status": "SUCCESS", "call_id": call_id}
+
+    except Exception as exc:
+        # If it's a Retry exception (from concurrency limit), let it propagate
+        if type(exc).__name__ == "Retry":
+            raise
+            
+        logger.exception(f"Error initiating outbound call for candidate {candidate_id}")
+        return {"status": "FAILED", "reason": str(exc)}
+    finally:
+        await redis.aclose()
+

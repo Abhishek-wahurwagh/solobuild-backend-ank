@@ -76,3 +76,35 @@ class WorkflowEventLogResponse(BaseModel):
     payload: dict | None
     created_at: datetime
     model_config = ConfigDict(from_attributes=True)
+
+class CallWebhookPayload(BaseModel):
+    call_id: str
+    candidate_id: UUID
+    campaign_id: UUID
+    status: str
+    transcript: str | None = None
+    recording_url: str | None = None
+
+
+class BatchUploadResponse(BaseModel):
+    batch_id: str
+    status: str
+    accepted_files: int
+
+
+class BatchStatusResponse(BaseModel):
+    batch_id: str
+    status: str
+    total_files: int
+    processed: int
+    failed: int
+    created_at: str | None = None
+    updated_at: str | None = None
+    finished_at: str | None = None
+    candidates: list[CandidateResponse] | None = None
+
+
+class ScreeningRequest(BaseModel):
+    candidate_ids: list[UUID] | None = None
+
+
