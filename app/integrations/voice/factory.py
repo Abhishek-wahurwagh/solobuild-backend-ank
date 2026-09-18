@@ -1,4 +1,3 @@
-import os
 from app.integrations.voice.providers.base import BaseVoiceProvider
 from app.integrations.voice.providers.mock import MockVoiceProvider
 from app.integrations.voice.providers.vobiz import VobizVoiceProvider

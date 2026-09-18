@@ -1,5 +1,5 @@
 from typing import Any
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from app.domains.campaigns.models import WorkflowStepStatus
 from uuid import UUID
 from datetime import datetime
@@ -38,6 +38,8 @@ class CandidateResponse(BaseModel):
     name: str | None = None
     email: str | None = None
     phone: str | None = None
+    file_url: str | None = None
+    ingestion_item_id: UUID | None = None
     extracted_fields: dict | None = None
     
     workflow_step: str | None = None
@@ -90,6 +92,12 @@ class BatchUploadResponse(BaseModel):
     batch_id: str
     status: str
     accepted_files: int
+    rejected_files: int
+
+
+class CampaignFieldsUpdate(BaseModel):
+    """JSON body for directly overwriting campaign required_fields."""
+    required_fields: dict
 
 
 class BatchStatusResponse(BaseModel):
@@ -101,10 +109,14 @@ class BatchStatusResponse(BaseModel):
     created_at: str | None = None
     updated_at: str | None = None
     finished_at: str | None = None
+    failed_files: list[str] = Field(default_factory=list)
     candidates: list[CandidateResponse] | None = None
 
 
 class ScreeningRequest(BaseModel):
     candidate_ids: list[UUID] | None = None
 
+class ScreeningBatchResponse(BaseModel):
+    batch_id: str
+    status: str
 

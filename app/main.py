@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, status
+from fastapi.openapi.utils import get_openapi
 from sqlalchemy import text
 
 from app.core.config import settings
@@ -58,6 +59,37 @@ app.include_router(analytics_router, prefix="/api/v1", tags=["Analytics"])
 """
 
 # Root & Health Check Endpoints
+
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    
+    openapi_schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+    
+    # Workaround for Swagger UI multiple file upload bug in OpenAPI 3.1.0
+    # It renders array of strings instead of file upload button unless we use `format: binary`
+    for path in openapi_schema.get("paths", {}).values():
+        for method in path.values():
+            content = method.get("requestBody", {}).get("content", {})
+            if "multipart/form-data" in content:
+                schema = content["multipart/form-data"].get("schema", {})
+                if "$ref" in schema:
+                    ref_name = schema["$ref"].split("/")[-1]
+                    comp = openapi_schema["components"]["schemas"].get(ref_name, {})
+                    for prop_val in comp.get("properties", {}).values():
+                        if prop_val.get("type") == "array" and prop_val.get("items", {}).get("type") == "string":
+                            prop_val["items"]["format"] = "binary"
+                            prop_val["items"].pop("contentMediaType", None)
+
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+
+app.openapi = custom_openapi
 @app.get("/", tags=["System"])
 async def root():
     return {"message": f"Welcome to {settings.PROJECT_NAME} API"}

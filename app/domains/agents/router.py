@@ -37,7 +37,12 @@ async def get_agent_endpoint(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    result = await db.execute(select(Agent).where(Agent.id == agent_id))
+    result = await db.execute(
+        select(Agent).where(
+            Agent.id == agent_id,
+            Agent.created_by_user_id == current_user.id,
+        )
+    )
     agent = result.scalar_one_or_none()
 
     if not agent:
@@ -60,6 +65,19 @@ async def update_agent_endpoint(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
+    # Ownership check: only the creator can update
+    result = await db.execute(
+        select(Agent).where(
+            Agent.id == agent_id,
+            Agent.created_by_user_id == current_user.id,
+        )
+    )
+    if result.scalar_one_or_none() is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Agent not found",
+        )
+
     return await AgentService.update_agent(
         db=db,
         agent_id=agent_id,
@@ -76,5 +94,17 @@ async def delete_agent_endpoint(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
+    # Ownership check: only the creator can delete
+    result = await db.execute(
+        select(Agent).where(
+            Agent.id == agent_id,
+            Agent.created_by_user_id == current_user.id,
+        )
+    )
+    if result.scalar_one_or_none() is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Agent not found",
+        )
+
     await AgentService.remove_agent(db=db, agent_id=agent_id)
-    return {"Agent Deleted Sucessufully"}

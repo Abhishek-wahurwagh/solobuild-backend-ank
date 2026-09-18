@@ -8,15 +8,13 @@ Contains:
 - Generic Document Text Extraction (PDF, DOCX, TXT)
 - Generic LLM Document Fields Extraction
 - Generic LLM Screening
+- Call webhook processing
 """
 
 from __future__ import annotations
 
 import asyncio
 import io
-import os
-import re
-import unicodedata
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,11 +22,29 @@ from typing import Any
 
 from fastapi import HTTPException, UploadFile, status
 from redis.asyncio import Redis
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.s3 import upload_fileobj_to_s3
+from app.domains.campaigns.models import (
+    CallScreening,
+    Campaign,
+    Candidate,
+    WorkflowStepStatus,
+)
+from app.domains.campaigns.schemas import CallWebhookPayload
+from app.domains.ingestion.models import IngestionItem
 from app.integrations.ai.factory import StructuredExtractionProviderFactory
 from app.integrations.ai.providers.base import StructuredExtractionProvider
+from app.domains.ingestion.text import (
+    extract_document_text,
+    extract_text_from_docx,
+    extract_text_from_pdf,
+    extract_text_from_txt,
+    normalize_text,
+    validate_magic_bytes,
+)
 
 
 # =========================================================================
@@ -36,7 +52,6 @@ from app.integrations.ai.providers.base import StructuredExtractionProvider
 # =========================================================================
 
 ALLOWED_EXTENSIONS: set[str] = {".pdf", ".docx", ".txt", ".zip"}
-BLOCKED_EXTENSIONS: set[str] = {".exe", ".js", ".html", ".csv", ".bat", ".sh", ".cmd", ".msi", ".dll"}
 
 EXT_TO_MIME: dict[str, set[str]] = {
     ".pdf": {"application/pdf"},
@@ -52,41 +67,53 @@ _ZIP_MAX_UNCOMPRESSED_BYTES = 500 * 1024 * 1024  # 500 MB
 _ZIP_MAX_RATIO = 50
 
 
-def validate_document_uploads(files: list[UploadFile]) -> list[UploadFile]:
+async def validate_document_uploads(files: list[UploadFile]) -> tuple[list[UploadFile], list[dict]]:
+    """
+    Validates uploaded files.
+    Returns a tuple of:
+    - list[UploadFile]: Files that passed validation.
+    - list[dict]: Details of files that failed validation.
+    """
+    valid_files = []
+    invalid_files = []
+
+    # Handle the empty list edge case up front
     if not files:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="At least one file is required.",
-        )
+        return [], [{"filename": "unknown", "reason": "No files were uploaded."}]
 
     for f in files:
+        # Check for missing filename
         if not f.filename:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Every uploaded file must have a filename.",
-            )
+            invalid_files.append({
+                "filename": "Unknown Filename",
+                "reason": "Every uploaded file must have a filename."
+            })
+            continue
+
         ext = Path(f.filename).suffix.lower()
 
-        if ext in BLOCKED_EXTENSIONS:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Blocked file type: {f.filename}",
-            )
+        # Check for allowed extension
         if ext not in ALLOWED_EXTENSIONS:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Unsupported file type: {f.filename}. Allowed: pdf, docx, txt, zip",
-            )
+            invalid_files.append({
+                "filename": f.filename,
+                "reason": f"Unsupported file type. Allowed: {', '.join(ALLOWED_EXTENSIONS)}"
+            })
+            continue
 
+        # Check for MIME type mismatch
         expected = EXT_TO_MIME.get(ext, set())
         actual = f.content_type or ""
         if actual and expected and actual not in expected:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"MIME mismatch for {f.filename}: got {actual}",
-            )
+            invalid_files.append({
+                "filename": f.filename,
+                "reason": f"MIME mismatch: expected one of {expected}, got {actual}"
+            })
+            continue
 
-    return files
+        # If it passes all checks, it's valid
+        valid_files.append(f)
+
+    return valid_files, invalid_files
 
 
 async def validate_zip_safety(data: bytes) -> list[str]:
@@ -217,12 +244,12 @@ async def update_batch_progress(
     await pipe.execute()
 
 
-async def complete_batch(redis: Redis, batch_id: str) -> None:
+async def complete_batch(redis: Redis, batch_id: str, status: str = "COMPLETED") -> None:
     now = datetime.now(timezone.utc).isoformat()
     await redis.hset(  # type: ignore
         f"job:{batch_id}",
         mapping={
-            "status": "COMPLETED",
+            "status": status,
             "finished_at": now,
             "updated_at": now,
         },
@@ -297,62 +324,80 @@ async def enqueue_campaign_screening(
 # TEXT EXTRACTION
 # =========================================================================
 
-def normalize_text(text: str) -> str:
-    text = unicodedata.normalize("NFKC", text)
-    text = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", text)
-    text = re.sub(r"\r\n?", "\n", text)
-    text = re.sub(r"[ \t\f\v]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
+async def build_campaign_raw_text(
+    raw_text: str | None,
+    uploaded_file: UploadFile | None,
+) -> str | None:
+    if raw_text is not None and uploaded_file is not None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Provide either raw_text or a requirement file, not both.",
+        )
 
-def extract_text_from_pdf(data: bytes) -> str:
-    from pypdf import PdfReader
-    reader = PdfReader(io.BytesIO(data))
-    pages = [page.extract_text() or "" for page in reader.pages]
-    return normalize_text("\n".join(pages))
+    candidate_parts: list[str] = []
+
+    if raw_text and raw_text.strip():
+        candidate_parts.append(raw_text.strip())
+
+    if uploaded_file is None:
+        return "\n\n".join(candidate_parts) if candidate_parts else None
+
+    filename = uploaded_file.filename or ""
+    if not filename:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Uploaded requirement file must include a filename.",
+        )
+
+    ext = Path(filename).suffix.lower()
+    if ext not in {".pdf", ".docx", ".txt"}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Campaign requirement file must be PDF, DOCX, or TXT.",
+        )
+
+    file_bytes = await uploaded_file.read()
+    if not file_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Uploaded requirement file is empty.",
+        )
+
+    if not validate_magic_bytes(file_bytes, ext):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Uploaded file does not match the expected {ext.upper()} signature.",
+        )
+
+    extracted = extract_document_text(file_bytes, ext)
+    if not extracted or not extracted.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Uploaded requirement file did not produce usable text.",
+        )
+
+    candidate_parts.append(extracted.strip())
+    return "\n\n".join(candidate_parts)
 
 
-def extract_text_from_docx(data: bytes) -> str:
-    from docx import Document
-    doc = Document(io.BytesIO(data))
-    parts: list[str] = [p.text for p in doc.paragraphs]
-    for table in doc.tables:
-        for row in table.rows:
-            parts.append(" | ".join(cell.text for cell in row.cells))
-    return normalize_text("\n".join(parts))
+async def extract_campaign_requirements_llm(
+    raw_text: str,
+    existing_fields: dict | None = None,
+    extraction_provider: StructuredExtractionProvider | None = None,
+) -> dict[str, Any]:
+    """Extract structured campaign requirements from already extracted text."""
+    if not raw_text or not raw_text.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Campaign requirement text cannot be empty.",
+        )
 
+    return await extract_document_fields_llm(
+        raw_text,
+        existing_fields=existing_fields,
+        extraction_provider=extraction_provider,
+    )
 
-def extract_text_from_txt(data: bytes) -> str:
-    for enc in ("utf-8", "latin-1", "cp1252"):
-        try:
-            return normalize_text(data.decode(enc))
-        except (UnicodeDecodeError, ValueError):
-            continue
-    return normalize_text(data.decode("utf-8", errors="replace"))
-
-
-def extract_document_text(data: bytes, ext: str) -> str | None:
-    try:
-        if ext == ".pdf":
-            return extract_text_from_pdf(data)
-        if ext == ".docx":
-            return extract_text_from_docx(data)
-        if ext == ".txt":
-            return extract_text_from_txt(data)
-    except Exception:
-        return None
-    return None
-
-def validate_magic_bytes(data: bytes, ext: str) -> bool:
-    if ext == ".pdf":
-        return data[:5] == b"%PDF-"
-    if ext == ".docx":
-        return data[:4] == b"PK\x03\x04"
-    if ext == ".txt":
-        sample = data[:512]
-        control = sum(1 for b in sample if b < 0x09 or (0x0E <= b <= 0x1F) or b == 0x7F)
-        return control <= 2
-    return False
 
 # =========================================================================
 # GENERIC LLM EXTRACTION & SCREENING
@@ -371,7 +416,13 @@ async def extract_document_fields_llm(
     if extraction_provider is None:
         extraction_provider = StructuredExtractionProviderFactory.build()
 
-    return await extraction_provider.extract(document_text, existing_fields)
+    try:
+        return await extraction_provider.extract(document_text, existing_fields)
+    except RuntimeError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"AI service is currently unavailable. Please try again later. Details: {e}",
+        )
 
 
 async def screen_document_llm(
@@ -382,21 +433,59 @@ async def screen_document_llm(
     if extraction_provider is None:
         extraction_provider = StructuredExtractionProviderFactory.build()
 
-    return await extraction_provider.screen_candidate(
-        candidate_text="",
-        candidate_fields=candidate_fields or {},
-        campaign_text="",
-        campaign_fields=campaign_fields or {},
+    try:
+        return await extraction_provider.screen_candidate(
+            candidate_text="",
+            candidate_fields=candidate_fields or {},
+            campaign_text="",
+            campaign_fields=campaign_fields or {},
+        )
+    except RuntimeError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"AI service is currently unavailable. Please try again later. Details: {e}",
+        )
+
+
+# =========================================================================
+# CANDIDATE PERSISTENCE
+# =========================================================================
+
+async def persist_candidate_from_ingestion(
+    db: AsyncSession,
+    *,
+    campaign_id,
+    item: IngestionItem,
+    source_url: str,
+    extracted_fields: dict[str, Any],
+) -> tuple[Candidate, bool]:
+    """Persist campaign-specific output for one generic ingestion item."""
+    existing_result = await db.execute(
+        select(Candidate).where(Candidate.ingestion_item_id == item.id)
     )
+    existing_candidate = existing_result.scalar_one_or_none()
+    if existing_candidate is not None:
+        return existing_candidate, False
+
+    candidate = Candidate(
+        campaign_id=campaign_id,
+        name=extracted_fields.get("name", "Unknown"),
+        email=extracted_fields.get("email"),
+        phone=extracted_fields.get("phone"),
+        file_url=source_url,
+        ingestion_item_id=item.id,
+        extracted_fields=extracted_fields,
+        workflow_step="document_extraction",
+        step_status=WorkflowStepStatus.COMPLETED,
+    )
+    db.add(candidate)
+    await db.flush()
+    return candidate, True
+
 
 # =========================================================================
 # WEBHOOK PROCESSING
 # =========================================================================
-
-from app.domains.campaigns.schemas import CallWebhookPayload
-from app.domains.campaigns.models import CallScreening, Candidate, Campaign
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 async def process_call_webhook(db: AsyncSession, payload: CallWebhookPayload) -> None:
     # 1. Fetch Candidate and Campaign
@@ -406,7 +495,7 @@ async def process_call_webhook(db: AsyncSession, payload: CallWebhookPayload) ->
     candidate = result.scalar_one_or_none()
     if not candidate:
         raise HTTPException(status_code=404, detail="Candidate not found")
-        
+
     result = await db.execute(
         select(Campaign).where(Campaign.id == payload.campaign_id)
     )
@@ -416,13 +505,12 @@ async def process_call_webhook(db: AsyncSession, payload: CallWebhookPayload) ->
 
     # 2. Extract Data from Transcript & Screen using Generic Engine
     extraction_provider = StructuredExtractionProviderFactory.build()
-    
+
     transcript = payload.transcript or ""
-    
-    # We pass existing fields so the LLM has context, but we instruct it 
-    # to extract new fields or updated info.
+
+    # Pass existing fields so the LLM has context, but extract new/updated info
     extracted_fields = await extraction_provider.extract(transcript, candidate.extracted_fields)
-    
+
     # Screen Candidate based on the new transcript + fields vs campaign requirements
     screening_result = await extraction_provider.screen_candidate(
         candidate_text=transcript,
@@ -430,7 +518,7 @@ async def process_call_webhook(db: AsyncSession, payload: CallWebhookPayload) ->
         campaign_text=campaign.raw_text or "",
         campaign_fields=campaign.required_fields or {},
     )
-    
+
     # 3. Create CallScreening record
     call_screening = CallScreening(
         campaign_id=campaign.id,
@@ -443,23 +531,23 @@ async def process_call_webhook(db: AsyncSession, payload: CallWebhookPayload) ->
         summary=screening_result.get("summary", ""),
     )
     db.add(call_screening)
-    
+
     # 4. Update Candidate Fields
-    # The rule is: data extracted from the direct phone call overwrites existing fields.
+    # Data extracted from the direct phone call overwrites existing fields.
     merged_fields = dict(candidate.extracted_fields or {})
     merged_fields.update(extracted_fields)
     candidate.extracted_fields = merged_fields
-    
-    # If the LLM returned primary fields, update them
+
     if "name" in extracted_fields and extracted_fields["name"]:
         candidate.name = extracted_fields["name"]
     if "email" in extracted_fields and extracted_fields["email"]:
         candidate.email = extracted_fields["email"]
     if "phone" in extracted_fields and extracted_fields["phone"]:
         candidate.phone = extracted_fields["phone"]
-        
+
+    # Single commit for all mutations above before calling the orchestrator
     await db.commit()
-    
+
     # 5. Notify Orchestrator to proceed to next step
     from app.domains.campaigns.orchestrator import on_step_completed
     await on_step_completed(

@@ -1,5 +1,4 @@
 from uuid import UUID
-from typing import Optional
 
 from fastapi import (
     APIRouter,
@@ -23,14 +22,32 @@ from app.domains.campaigns.models import (
     Candidate,
     WorkflowStepStatus,
 )
-from app.domains.campaigns.schemas import BatchStatusResponse, BatchUploadResponse, CampaignResponse, CandidateResponse, ScreeningRequest
+from app.domains.campaigns.schemas import (
+    BatchStatusResponse,
+    BatchUploadResponse,
+    CampaignFieldsUpdate,
+    CampaignResponse,
+    CandidateResponse,
+    ScreeningBatchResponse,
+    ScreeningRequest,
+)
 from app.domains.campaigns.service import (
+    build_campaign_raw_text,
     create_batch_tracker,
     enqueue_document_upload_batch,
     enqueue_campaign_screening,
+    extract_campaign_requirements_llm,
     get_batch_status,
     stage_files_to_s3,
     validate_document_uploads,
+    extract_document_fields_llm
+)
+from app.domains.ingestion.service import create_ingestion_batch
+from app.domains.ingestion.models import (
+    IngestionBatch,
+    IngestionBatchStatus,
+    IngestionItem,
+    IngestionItemStatus,
 )
 from app.domains.users.models import User
 
@@ -45,12 +62,22 @@ router = APIRouter(prefix="/campaigns")
 async def create_campaign(
     title: str = Form(...),
     raw_text: str | None = Form(None),
+    file: UploadFile | None = File(None),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    resulting_raw_text = await build_campaign_raw_text(raw_text, file)
+    if not resulting_raw_text:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Provide either raw_text or a requirement file.",
+        )
+
+    required_fields = await extract_document_fields_llm(resulting_raw_text)
     campaign = Campaign(
         title=title,
-        raw_text=raw_text,
+        raw_text=resulting_raw_text,
+        required_fields=required_fields,
         created_by_user_id=current_user.id,
     )
     db.add(campaign)
@@ -62,11 +89,12 @@ async def create_campaign(
 @router.patch("/{campaign_id}", response_model=CampaignResponse)
 async def update_campaign(
     campaign_id: UUID,
-    raw_text: str | None = Body(None),
-    required_fields: dict | None = Body(None),
+    raw_text: str | None = Form(None),
+    file: UploadFile | None = File(None),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """Update campaign raw text / requirement file. Accepts multipart/form-data."""
     result = await db.execute(
         select(Campaign).where(
             Campaign.id == campaign_id,
@@ -77,10 +105,36 @@ async def update_campaign(
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
 
-    if raw_text is not None:
-        campaign.raw_text = raw_text
-    if required_fields is not None:
-        campaign.required_fields = required_fields
+    if raw_text is not None or file is not None:
+        campaign.raw_text = await build_campaign_raw_text(raw_text, file)
+        campaign.required_fields = await extract_campaign_requirements_llm(
+            campaign.raw_text,
+        )
+
+    await db.commit()
+    await db.refresh(campaign)
+    return campaign
+
+
+@router.patch("/{campaign_id}/fields", response_model=CampaignResponse)
+async def update_campaign_fields(
+    campaign_id: UUID,
+    body: CampaignFieldsUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Directly overwrite campaign required_fields without re-extracting via LLM. Accepts JSON body."""
+    result = await db.execute(
+        select(Campaign).where(
+            Campaign.id == campaign_id,
+            Campaign.created_by_user_id == current_user.id,
+        )
+    )
+    campaign = result.scalar_one_or_none()
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    campaign.required_fields = body.required_fields
 
     await db.commit()
     await db.refresh(campaign)
@@ -147,9 +201,27 @@ async def upload_candidates(
     if campaign is None:
         raise HTTPException(status_code=404, detail="Campaign not found.")
 
-    validate_document_uploads(files)
-    batch_id = f"batch_{uuid7()}"
-    s3_prefix, source_type = await stage_files_to_s3(batch_id, files)
+    valid_files, invalid_files = await validate_document_uploads(files)
+    batch_uuid = uuid7()
+    batch_id = f"batch_{batch_uuid}"
+    s3_prefix, source_type = await stage_files_to_s3(batch_id, valid_files)
+
+    ingestion_items = [
+        {
+            "source_key": f"{s3_prefix}/{file.filename}",
+            "display_name": file.filename or "unknown",
+        }
+        for file in valid_files
+    ]
+    await create_ingestion_batch(
+        db,
+        batch_uuid=batch_uuid,
+        context_type="campaign_candidates",
+        context_id=campaign_id,
+        created_by_user_id=current_user.id,
+        items=ingestion_items,
+    )
+    await db.commit()
 
     redis = await get_redis_pool()
     try:
@@ -167,7 +239,88 @@ async def upload_candidates(
     return BatchUploadResponse(
         batch_id=batch_id,
         status="QUEUED",
-        accepted_files=len(files),
+        accepted_files=len(valid_files),
+        rejected_files=len(invalid_files)
+    )
+
+
+@router.post(
+    "/{campaign_id}/candidates/upload/{batch_id}/retry",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=BatchUploadResponse,
+)
+async def retry_failed_upload(
+    campaign_id: UUID,
+    batch_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    campaign_result = await db.execute(
+        select(Campaign).where(
+            Campaign.id == campaign_id,
+            Campaign.created_by_user_id == current_user.id,
+        )
+    )
+    if campaign_result.scalar_one_or_none() is None:
+        raise HTTPException(status_code=404, detail="Campaign not found.")
+
+    try:
+        ingestion_batch_id = UUID(batch_id.removeprefix("batch_"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid batch ID.") from exc
+
+    batch = await db.get(IngestionBatch, ingestion_batch_id)
+    if batch is None or batch.context_id != campaign_id:
+        raise HTTPException(status_code=404, detail="Batch not found.")
+
+    item_result = await db.execute(
+        select(IngestionItem).where(
+            IngestionItem.batch_id == ingestion_batch_id,
+            IngestionItem.status.in_(
+                [IngestionItemStatus.FAILED, IngestionItemStatus.RETRYABLE]
+            ),
+        )
+    )
+    retry_items = item_result.scalars().all()
+    if not retry_items:
+        raise HTTPException(status_code=409, detail="Batch has no failed files to retry.")
+
+    source_result = await db.execute(
+        select(IngestionItem.source_key).where(
+            IngestionItem.batch_id == ingestion_batch_id,
+            IngestionItem.member_path.is_(None),
+        ).limit(1)
+    )
+    source_key = source_result.scalar_one_or_none()
+    if not source_key:
+        raise HTTPException(status_code=409, detail="Batch source is unavailable.")
+
+    s3_prefix = source_key.rsplit("/", 1)[0]
+    for item in retry_items:
+        item.status = IngestionItemStatus.PENDING
+        item.current_stage = None
+        item.last_error = None
+    batch.status = IngestionBatchStatus.QUEUED
+    await db.commit()
+
+    redis = await get_redis_pool()
+    try:
+        await create_batch_tracker(redis, batch_id, file_count=len(retry_items))
+        await enqueue_document_upload_batch(
+            redis,
+            batch_id=batch_id,
+            campaign_id=str(campaign_id),
+            s3_prefix=s3_prefix,
+            source_type="retry",
+        )
+    finally:
+        await redis.aclose()
+
+    return BatchUploadResponse(
+        batch_id=batch_id,
+        status="QUEUED",
+        accepted_files=len(retry_items),
+        rejected_files=0,
     )
 
 
@@ -181,6 +334,15 @@ async def batch_status(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    campaign_result = await db.execute(
+        select(Campaign).where(
+            Campaign.id == campaign_id,
+            Campaign.created_by_user_id == current_user.id,
+        )
+    )
+    if campaign_result.scalar_one_or_none() is None:
+        raise HTTPException(status_code=404, detail="Campaign not found.")
+
     redis = await get_redis_pool()
     try:
         data = await get_batch_status(redis, batch_id)
@@ -192,6 +354,21 @@ async def batch_status(
 
     status_val = data.get("status", "UNKNOWN")
     candidates = None
+    failed_files: list[str] = []
+
+    try:
+        ingestion_batch_id = UUID(batch_id.removeprefix("batch_"))
+        failed_result = await db.execute(
+            select(IngestionItem.display_name).where(
+                IngestionItem.batch_id == ingestion_batch_id,
+                IngestionItem.status.in_(
+                    [IngestionItemStatus.FAILED, IngestionItemStatus.RETRYABLE]
+                ),
+            )
+        )
+        failed_files = list(failed_result.scalars().all())
+    except ValueError:
+        pass
 
     if status_val == "COMPLETED":
         result = await db.execute(
@@ -211,6 +388,7 @@ async def batch_status(
         created_at=data.get("created_at"),
         updated_at=data.get("updated_at"),
         finished_at=data.get("finished_at"),
+        failed_files=failed_files,
         candidates=candidates,
     )
 
@@ -228,6 +406,16 @@ async def get_candidates(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    # Verify the requesting user owns this campaign
+    campaign_result = await db.execute(
+        select(Campaign).where(
+            Campaign.id == campaign_id,
+            Campaign.created_by_user_id == current_user.id,
+        )
+    )
+    if campaign_result.scalar_one_or_none() is None:
+        raise HTTPException(status_code=404, detail="Campaign not found.")
+
     result = await db.execute(
         select(Candidate).where(Candidate.campaign_id == campaign_id)
     )
@@ -237,7 +425,7 @@ async def get_candidates(
 @router.post(
     "/{campaign_id}/candidates/screen",
     status_code=status.HTTP_202_ACCEPTED,
-    response_model=BatchUploadResponse,
+    response_model=ScreeningBatchResponse,
 )
 async def screen_candidates(
     campaign_id: UUID,
@@ -259,7 +447,7 @@ async def screen_candidates(
     try:
         await create_batch_tracker(redis, batch_id, file_count=0)
         candidate_ids_str = [str(cid) for cid in request.candidate_ids] if request.candidate_ids else None
-        
+
         await enqueue_campaign_screening(
             redis,
             batch_id=batch_id,
@@ -269,12 +457,10 @@ async def screen_candidates(
     finally:
         await redis.aclose()
 
-    return BatchUploadResponse(
+    return ScreeningBatchResponse(
         batch_id=batch_id,
         status="QUEUED",
-        accepted_files=len(request.candidate_ids) if request.candidate_ids else 0,
     )
-
 
 @router.get(
     "/{campaign_id}/candidates/screen/{batch_id}/status",

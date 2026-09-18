@@ -26,6 +26,11 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str = "your-gemini-key"
     GEMINI_EMBEDDING_MODEL: str = "models/text-embedding-004"
     GEMINI_EXTRACTION_MODEL: str = "gemini-1.5-flash"
+    LLM_REQUEST_TIMEOUT_SECONDS: int = 180
+    LLM_MAX_RETRIES: int = 2
+    LLM_RETRY_DELAY_SECONDS: float = 2.0
+    WORKER_MAX_TRIES: int = 3
+    ARQ_JOB_TIMEOUT_SECONDS: int = 1800
 
     # Redis
     REDIS_URL: str = "redis://localhost:6379"

@@ -13,6 +13,7 @@ from app.core.database import Base
 from app.domains.users.models import User
 from app.domains.agents.models import Agent, AgentPreset
 from app.domains.campaigns.models import WorkflowTemplate, Campaign, Candidate, DocumentScreening, CallScreening, WorkflowEventLog
+from app.domains.ingestion.models import IngestionBatch, IngestionItem
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

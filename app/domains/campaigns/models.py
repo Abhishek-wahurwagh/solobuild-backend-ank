@@ -56,6 +56,10 @@ class Candidate(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=True)
     email: Mapped[str] = mapped_column(String(255), nullable=True)
     phone: Mapped[str] = mapped_column(String(50), nullable=True)
+    file_url: Mapped[str] = mapped_column(Text, nullable=True)
+    ingestion_item_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("ingestion_items.id"), nullable=True, unique=True
+    )
     extracted_fields: Mapped[dict] = mapped_column(JSONB, nullable=True, default=dict)
     
     workflow_step: Mapped[str] = mapped_column(String(255), nullable=True)

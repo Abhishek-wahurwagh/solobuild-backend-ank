@@ -17,7 +17,7 @@ import logging
 from arq.connections import RedisSettings
 
 from app.core.config import settings
-from app.domains.campaigns.worker import process_resume_upload_batch, screen_campaign_candidates
+from app.domains.campaigns.worker import process_document_upload_batch, screen_campaign_candidates
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,17 +33,17 @@ def _parse_redis_settings() -> RedisSettings:
 class WorkerSettings:
     """Configuration object consumed by ``arq``."""
 
-    functions = [process_resume_upload_batch, screen_campaign_candidates]
+    functions = [process_document_upload_batch, screen_campaign_candidates]
     redis_settings = _parse_redis_settings()
 
     # Concurrency: how many jobs run simultaneously
     max_jobs = 5
 
-    # Timeout per job (10 minutes should cover even large batches)
-    job_timeout = 600
+    # Batch timeout is separate from the per-request LLM timeout.
+    job_timeout = settings.ARQ_JOB_TIMEOUT_SECONDS
 
-    # Retry on failure once
-    max_tries = 2
+    # ARQ retries unexpected whole-worker failures; per-file retries are separate.
+    max_tries = settings.WORKER_MAX_TRIES
 
     # Health-check key prefix
     health_check_key = "arq:solobuildai:health"

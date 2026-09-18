@@ -1,8 +1,10 @@
+import asyncio
 import json
 import re
 from typing import Any
 
 from app.integrations.ai.providers.base import StructuredExtractionProvider
+from app.core.config import settings
 
 class GeminiStructuredExtractor(StructuredExtractionProvider):
     def __init__(self, api_key: str, model: str = "gemini-3.6-flash"):
@@ -13,6 +15,26 @@ class GeminiStructuredExtractor(StructuredExtractionProvider):
 
         self.client = genai.Client(api_key=api_key)
         self.model = model
+
+    async def _generate_content(self, prompt: str):
+        try:
+            return await asyncio.wait_for(
+                self.client.aio.models.generate_content(
+                    model=self.model,
+                    contents=prompt,
+                    config={
+                        "temperature": 0.0,
+                        "response_mime_type": "application/json",
+                    },
+                ),
+                timeout=settings.LLM_REQUEST_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(
+                f"LLM request timed out after {settings.LLM_REQUEST_TIMEOUT_SECONDS} seconds."
+            ) from exc
+        except Exception as exc:
+            raise RuntimeError(f"LLM request failed: {exc}") from exc
 
     async def extract(self, document_text: str, existing_fields: dict | None = None) -> dict[str, Any]:
         existing_str = json.dumps(existing_fields) if existing_fields else "{}"
@@ -35,14 +57,7 @@ Document Text:
 {document_text}
 """
 
-        response = await self.client.aio.models.generate_content(
-            model=self.model,
-            contents=prompt,
-            config={
-                "temperature": 0.0,
-                "response_mime_type": "application/json",
-            },
-        )
+        response = await self._generate_content(prompt)
 
         text = getattr(response, "text", None)
         if not text:
@@ -95,14 +110,7 @@ Your task is to compare the Candidate against the Campaign and output a JSON obj
 
 Output valid JSON only.
 """
-        response = await self.client.aio.models.generate_content(
-            model=self.model,
-            contents=prompt,
-            config={
-                "temperature": 0.0,
-                "response_mime_type": "application/json",
-            },
-        )
+        response = await self._generate_content(prompt)
 
         text = getattr(response, "text", None)
         if not text:

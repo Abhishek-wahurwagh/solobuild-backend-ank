@@ -16,7 +16,6 @@ class AgentCreate(BaseModel):
     languages: LanguagePreference
     voice: VoicePreference
     interview_instruction: Annotated[str, Field(min_length=3, max_length=2000)]
-    created_by_user_id: UUID
 
     model_config = ConfigDict(use_enum_values=True)
 

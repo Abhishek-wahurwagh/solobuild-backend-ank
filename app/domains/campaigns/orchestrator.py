@@ -1,9 +1,13 @@
 import logging
 from uuid import UUID
 from typing import Any
+
+from arq import create_pool
+from arq.connections import RedisSettings
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
+from app.core.config import settings
 from app.domains.campaigns.models import (
     Candidate,
     Campaign,
@@ -17,9 +21,27 @@ logger = logging.getLogger("solo.orchestrator")
 
 # A mapping of service names to their background task names in ARQ
 SERVICE_TO_TASK_MAP = {
-    "document_screening": "task_parse_and_screen",
+    "document_screening": "screen_campaign_candidates",
     "outbound_call": "task_initiate_outbound_call",
 }
+
+async def enqueue_workflow_task(*, task_name: str, campaign_id: UUID, candidate_id: UUID | None = None) -> None:
+    """Enqueue a workflow task in ARQ using the app Redis connection."""
+    pool = await create_pool(RedisSettings.from_dsn(settings.REDIS_URL))
+    try:
+        if task_name == "screen_campaign_candidates":
+            await pool.enqueue_job(
+                task_name,
+                batch_id=f"screen_{UUID(int=0)}",
+                campaign_id=str(campaign_id),
+                candidate_ids=[str(candidate_id)] if candidate_id else None,
+            )
+            return
+
+        if candidate_id is not None:
+            await pool.enqueue_job(task_name, candidate_id=candidate_id)
+    finally:
+        await pool.aclose()
 
 
 def _evaluate_condition(condition: dict, payload: dict) -> bool:
@@ -69,7 +91,21 @@ async def on_step_completed(
 
     stmt = select(Campaign).where(Campaign.id == candidate.campaign_id)
     campaign = (await db.execute(stmt)).scalar_one_or_none()
-    if not campaign or not campaign.workflow_template_id:
+    if not campaign:
+        logger.error(f"Campaign {candidate.campaign_id} not found.")
+        return
+
+    # 2. Log the event regardless of workflow routing
+    event = WorkflowEventLog(
+        campaign_id=campaign.id,
+        candidate_id=candidate.id,
+        service_name=service_name,
+        status="COMPLETED",
+        payload=payload
+    )
+    db.add(event)
+
+    if not campaign.workflow_template_id:
         # If no workflow is attached, we just mark it completed and stop.
         candidate.step_status = WorkflowStepStatus.COMPLETED
         await db.commit()
@@ -81,16 +117,6 @@ async def on_step_completed(
         candidate.step_status = WorkflowStepStatus.COMPLETED
         await db.commit()
         return
-
-    # 2. Log the event
-    event = WorkflowEventLog(
-        campaign_id=campaign.id,
-        candidate_id=candidate.id,
-        service_name=service_name,
-        status="COMPLETED",
-        payload=payload
-    )
-    db.add(event)
 
     # 3. Find workflow rules for the service that just finished
     pipeline_steps = template.template.get("steps", {})
@@ -106,34 +132,34 @@ async def on_step_completed(
     exec_mode = current_config.get("execution_mode", "MANUAL")
     trigger_condition = current_config.get("trigger_condition")
 
-    # Update candidate to point to next step
     candidate.workflow_step = next_step
-    
+
     if exec_mode == "MANUAL":
-        # Waits for human intervention via API
         candidate.step_status = WorkflowStepStatus.READY_FOR_ACTION
         await db.commit()
         logger.info(f"Candidate {candidate_id} is READY_FOR_ACTION for next step: {next_step}")
-        
+
     elif exec_mode == "AUTOMATIC":
-        # Evaluate condition if one exists
         if trigger_condition and not _evaluate_condition(trigger_condition, payload):
             logger.info(f"Candidate {candidate_id} did not meet condition for {next_step}. Stopping.")
             candidate.step_status = WorkflowStepStatus.COMPLETED
             await db.commit()
             return
-            
-        # Trigger next background task via ARQ
+
+        task_name = SERVICE_TO_TASK_MAP.get(next_step)
+        if task_name is None:
+            logger.error(f"No background task mapping found for service {next_step}")
+            candidate.step_status = WorkflowStepStatus.FAILED
+            await db.commit()
+            return
+
         candidate.step_status = WorkflowStepStatus.PENDING
         await db.commit()
-        
-        task_name = SERVICE_TO_TASK_MAP.get(next_step)
-        if task_name:
-            # Note: We assume Redis pool (ARQ) is configured globally or passed in 
-            # In real implementation you'd use `arq_pool.enqueue_job(task_name, candidate.id)`
-            logger.info(f"Auto-triggering ARQ task {task_name} for Candidate {candidate_id}")
-            # Mocking enqueue:
-            # await arq_pool.enqueue_job(task_name, candidate.id)
-        else:
-            logger.error(f"No background task mapping found for service {next_step}")
+
+        logger.info(f"Auto-triggering ARQ task {task_name} for Candidate {candidate_id}")
+        await enqueue_workflow_task(
+            task_name=task_name,
+            campaign_id=campaign.id,
+            candidate_id=candidate.id,
+        )
 

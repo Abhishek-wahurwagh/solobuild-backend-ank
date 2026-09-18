@@ -1,6 +1,5 @@
 import logging
 from uuid import UUID
-import httpx
 from app.core.config import settings
 from app.integrations.voice.providers.base import BaseVoiceProvider
 
