@@ -57,7 +57,7 @@ async def process_document_upload_batch(
         tmp_dir = Path(tempfile.mkdtemp(prefix=f"document_batch_{batch_id}_"))
         logger.info("Batch %s: downloading from s3://%s/%s", batch_id, settings.AWS_BUCKET_NAME, s3_prefix)
 
-        downloaded = await asyncio.to_thread(download_s3_prefix, s3_prefix, tmp_dir)
+        await asyncio.to_thread(download_s3_prefix, s3_prefix, tmp_dir)
         files = collect_processable_files(tmp_dir)
         if not files:
             await fail_batch(redis, batch_id, "No processable files found after download.")

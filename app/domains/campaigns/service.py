@@ -63,10 +63,6 @@ EXT_TO_MIME: dict[str, set[str]] = {
     ".zip": {"application/zip", "application/x-zip-compressed", "application/octet-stream"},
 }
 
-_ZIP_MAX_UNCOMPRESSED_BYTES = 500 * 1024 * 1024  # 500 MB
-_ZIP_MAX_RATIO = 50
-
-
 async def validate_document_uploads(files: list[UploadFile]) -> tuple[list[UploadFile], list[dict]]:
     """
     Validates uploaded files.
@@ -135,12 +131,12 @@ async def validate_zip_safety(data: bytes) -> list[str]:
 
     total_uncompressed = sum(i.file_size for i in infos)
     compressed_size = len(data)
-    if total_uncompressed > _ZIP_MAX_UNCOMPRESSED_BYTES:
+    if total_uncompressed > settings.ZIP_MAX_UNCOMPRESSED_BYTES:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Zip file exceeds maximum uncompressed size.",
         )
-    if compressed_size > 0 and (total_uncompressed / compressed_size) > _ZIP_MAX_RATIO:
+    if compressed_size > 0 and (total_uncompressed / compressed_size) > settings.ZIP_MAX_RATIO:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Zip compression ratio is suspiciously high.",

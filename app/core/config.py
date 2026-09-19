@@ -42,6 +42,8 @@ class Settings(BaseSettings):
 
     # Resume pipeline
     RESUME_MAX_FILE_COUNT: int = 500
+    ZIP_MAX_UNCOMPRESSED_BYTES: int = 500 * 1024 * 1024
+    ZIP_MAX_RATIO: int = 50
 
     model_config = SettingsConfigDict(
         env_file=".env",
