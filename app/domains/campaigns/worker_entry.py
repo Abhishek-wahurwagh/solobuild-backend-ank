@@ -17,7 +17,7 @@ import logging
 from arq.connections import RedisSettings
 
 from app.core.config import settings
-from app.domains.campaigns.worker import process_document_upload_batch, screen_campaign_candidates
+from app.domains.campaigns.worker import process_document_upload_batch, screen_campaign_candidates, call_campaign_candidates
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,7 +33,7 @@ def _parse_redis_settings() -> RedisSettings:
 class WorkerSettings:
     """Configuration object consumed by ``arq``."""
 
-    functions = [process_document_upload_batch, screen_campaign_candidates]
+    functions = [process_document_upload_batch, screen_campaign_candidates, call_campaign_candidates]
     redis_settings = _parse_redis_settings()
 
     # Concurrency: how many jobs run simultaneously

@@ -13,6 +13,8 @@ dependencies = [
     "pydantic-settings>=2.15.0",
     "pyjwt>=2.13.0",
     "pypdf>=6.18.1",
+    "pipecat-ai[google,silero,websocket]>=1.8.1,<1.9",
+    "pipecat-vobiz>=0.0.3,<0.1",
     "python-docx>=1.2.0",
     "python-magic-bin>=0.4.14",
     "redis[hiredis]>=5.0.0",
@@ -23,7 +25,11 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=9.1.1",
+    "pytest-asyncio>=1.1.0",
 ]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

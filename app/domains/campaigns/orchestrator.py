@@ -15,24 +15,26 @@ from app.domains.campaigns.models import (
     WorkflowStepStatus,
     WorkflowEventLog
 )
-from app.core.redis import get_redis_pool
+from app.core.redis import get_redis_client
 
 logger = logging.getLogger("solo.orchestrator")
 
 # A mapping of service names to their background task names in ARQ
 SERVICE_TO_TASK_MAP = {
     "document_screening": "screen_campaign_candidates",
-    "outbound_call": "task_initiate_outbound_call",
+    "outbound_call": "call_campaign_candidates",
 }
 
 async def enqueue_workflow_task(*, task_name: str, campaign_id: UUID, candidate_id: UUID | None = None) -> None:
     """Enqueue a workflow task in ARQ using the app Redis connection."""
     pool = await create_pool(RedisSettings.from_dsn(settings.REDIS_URL))
     try:
-        if task_name == "screen_campaign_candidates":
+        if task_name in ("screen_campaign_candidates", "call_campaign_candidates"):
+            from uuid import uuid7
+            prefix = "call" if task_name == "call_campaign_candidates" else "screen"
             await pool.enqueue_job(
                 task_name,
-                batch_id=f"screen_{UUID(int=0)}",
+                batch_id=f"{prefix}_{uuid7()}",
                 campaign_id=str(campaign_id),
                 candidate_ids=[str(candidate_id)] if candidate_id else None,
             )

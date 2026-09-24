@@ -120,3 +120,9 @@ class ScreeningBatchResponse(BaseModel):
     batch_id: str
     status: str
 
+class CallingRequest(BaseModel):
+    candidate_ids: list[UUID] | None = None
+
+class CallingBatchResponse(BaseModel):
+    batch_id: str
+    status: str

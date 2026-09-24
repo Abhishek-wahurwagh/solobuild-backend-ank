@@ -63,6 +63,10 @@ EXT_TO_MIME: dict[str, set[str]] = {
     ".zip": {"application/zip", "application/x-zip-compressed", "application/octet-stream"},
 }
 
+_ZIP_MAX_UNCOMPRESSED_BYTES = 500 * 1024 * 1024  # 500 MB
+_ZIP_MAX_RATIO = 50
+
+
 async def validate_document_uploads(files: list[UploadFile]) -> tuple[list[UploadFile], list[dict]]:
     """
     Validates uploaded files.
@@ -131,12 +135,12 @@ async def validate_zip_safety(data: bytes) -> list[str]:
 
     total_uncompressed = sum(i.file_size for i in infos)
     compressed_size = len(data)
-    if total_uncompressed > settings.ZIP_MAX_UNCOMPRESSED_BYTES:
+    if total_uncompressed > _ZIP_MAX_UNCOMPRESSED_BYTES:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Zip file exceeds maximum uncompressed size.",
         )
-    if compressed_size > 0 and (total_uncompressed / compressed_size) > settings.ZIP_MAX_RATIO:
+    if compressed_size > 0 and (total_uncompressed / compressed_size) > _ZIP_MAX_RATIO:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Zip compression ratio is suspiciously high.",
@@ -316,6 +320,26 @@ async def enqueue_campaign_screening(
     await pool.aclose()
 
 
+async def enqueue_campaign_calling(
+    redis: Redis,
+    *,
+    batch_id: str,
+    campaign_id: str,
+    candidate_ids: list[str] | None = None,
+) -> None:
+    from arq import create_pool
+    from arq.connections import RedisSettings
+
+    pool = await create_pool(RedisSettings.from_dsn(settings.REDIS_URL))
+    await pool.enqueue_job(
+        "call_campaign_candidates",
+        batch_id=batch_id,
+        campaign_id=campaign_id,
+        candidate_ids=candidate_ids,
+    )
+    await pool.aclose()
+
+
 # =========================================================================
 # TEXT EXTRACTION
 # =========================================================================
@@ -483,76 +507,95 @@ async def persist_candidate_from_ingestion(
 # WEBHOOK PROCESSING
 # =========================================================================
 
-async def process_call_webhook(db: AsyncSession, payload: CallWebhookPayload) -> None:
-    # 1. Fetch Candidate and Campaign
-    result = await db.execute(
-        select(Candidate).where(Candidate.id == payload.candidate_id)
-    )
-    candidate = result.scalar_one_or_none()
-    if not candidate:
-        raise HTTPException(status_code=404, detail="Candidate not found")
+async def process_call_webhook(payload: CallWebhookPayload) -> None:
+    from app.core.database import AsyncSessionLocal
+    from app.core.redis import get_redis_client
+    
+    # 1. Fetch Candidate and Campaign (short transaction)
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(Candidate).where(Candidate.id == payload.candidate_id)
+        )
+        candidate = result.scalar_one_or_none()
+        if not candidate:
+            raise HTTPException(status_code=404, detail="Candidate not found")
 
-    result = await db.execute(
-        select(Campaign).where(Campaign.id == payload.campaign_id)
-    )
-    campaign = result.scalar_one_or_none()
-    if not campaign:
-        raise HTTPException(status_code=404, detail="Campaign not found")
+        result = await db.execute(
+            select(Campaign).where(Campaign.id == payload.campaign_id)
+        )
+        campaign = result.scalar_one_or_none()
+        if not campaign:
+            raise HTTPException(status_code=404, detail="Campaign not found")
 
-    # 2. Extract Data from Transcript & Screen using Generic Engine
+        candidate_fields = dict(candidate.extracted_fields or {})
+        campaign_text = campaign.raw_text or ""
+        campaign_fields = dict(campaign.required_fields or {})
+        campaign_id = campaign.id
+        candidate_id = candidate.id
+
+    # 2. Extract Data from Transcript & Screen using Generic Engine (No DB lock)
     extraction_provider = StructuredExtractionProviderFactory.build()
-
     transcript = payload.transcript or ""
 
-    # Pass existing fields so the LLM has context, but extract new/updated info
-    extracted_fields = await extraction_provider.extract(transcript, candidate.extracted_fields)
+    extracted_fields = await extraction_provider.extract(transcript, candidate_fields)
 
-    # Screen Candidate based on the new transcript + fields vs campaign requirements
     screening_result = await extraction_provider.screen_candidate(
         candidate_text=transcript,
         candidate_fields=extracted_fields,
-        campaign_text=campaign.raw_text or "",
-        campaign_fields=campaign.required_fields or {},
+        campaign_text=campaign_text,
+        campaign_fields=campaign_fields,
     )
 
-    # 3. Create CallScreening record
-    call_screening = CallScreening(
-        campaign_id=campaign.id,
-        candidate_id=candidate.id,
-        transcript=transcript,
-        recording_url=payload.recording_url,
-        match_score=screening_result.get("match_score", 0.0),
-        matched_fields=screening_result.get("matched_fields", {}),
-        unmatched_fields=screening_result.get("unmatched_fields", {}),
-        summary=screening_result.get("summary", ""),
-    )
-    db.add(call_screening)
+    # 3. Create CallScreening record and update Candidate (short transaction)
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(Candidate).where(Candidate.id == payload.candidate_id)
+        )
+        candidate = result.scalar_one_or_none()
+        if not candidate:
+            return
 
-    # 4. Update Candidate Fields
-    # Data extracted from the direct phone call overwrites existing fields.
-    merged_fields = dict(candidate.extracted_fields or {})
-    merged_fields.update(extracted_fields)
-    candidate.extracted_fields = merged_fields
+        call_screening = CallScreening(
+            campaign_id=campaign_id,
+            candidate_id=candidate_id,
+            transcript=transcript,
+            recording_url=payload.recording_url,
+            match_score=screening_result.get("match_score", 0.0),
+            matched_fields=screening_result.get("matched_fields", {}),
+            unmatched_fields=screening_result.get("unmatched_fields", {}),
+            summary=screening_result.get("summary", ""),
+        )
+        db.add(call_screening)
 
-    if "name" in extracted_fields and extracted_fields["name"]:
-        candidate.name = extracted_fields["name"]
-    if "email" in extracted_fields and extracted_fields["email"]:
-        candidate.email = extracted_fields["email"]
-    if "phone" in extracted_fields and extracted_fields["phone"]:
-        candidate.phone = extracted_fields["phone"]
+        merged_fields = dict(candidate.extracted_fields or {})
+        merged_fields.update(extracted_fields)
+        candidate.extracted_fields = merged_fields
 
-    # Single commit for all mutations above before calling the orchestrator
-    await db.commit()
+        if "name" in extracted_fields and extracted_fields["name"]:
+            candidate.name = extracted_fields["name"]
+        if "email" in extracted_fields and extracted_fields["email"]:
+            candidate.email = extracted_fields["email"]
+        if "phone" in extracted_fields and extracted_fields["phone"]:
+            candidate.phone = extracted_fields["phone"]
 
-    # 5. Notify Orchestrator to proceed to next step
-    from app.domains.campaigns.orchestrator import on_step_completed
-    await on_step_completed(
-        db=db,
-        candidate_id=candidate.id,
-        service_name="outbound_call",
-        payload={
-            "call_id": payload.call_id,
-            "status": payload.status,
-            "match_score": call_screening.match_score,
-        }
-    )
+        await db.commit()
+
+        # 5. Notify Orchestrator to proceed to next step
+        from app.domains.campaigns.orchestrator import on_step_completed
+        await on_step_completed(
+            db=db,
+            candidate_id=candidate.id,
+            service_name="outbound_call",
+            payload={
+                "call_id": payload.call_id,
+                "status": payload.status,
+                "match_score": call_screening.match_score,
+            }
+        )
+
+    # Clean up Redis concurrency tracker
+    redis = await get_redis_client()
+    try:
+        await redis.srem(f"campaign_active_calls:{payload.campaign_id}", str(payload.candidate_id))
+    finally:
+        await redis.aclose()

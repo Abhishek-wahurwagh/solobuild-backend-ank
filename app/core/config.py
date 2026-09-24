@@ -35,10 +35,27 @@ class Settings(BaseSettings):
     # Redis
     REDIS_URL: str = "redis://localhost:6379"
 
-    # Voice & Telephony
-    VOICE_PROVIDER: str = "mock"
-    VOBIZ_API_KEY: str = ""
-    PIPECAT_WEBHOOK_URL: str = ""
+    # Telephony and real-time voice runtime
+    TELEPHONY_CARRIER: str = "vobiz"
+    APP_BASE_URL: str = "http://localhost:8000"
+    VOBIZ_API_BASE_URL: str = "https://api.vobiz.ai/api/v1"
+    VOBIZ_AUTH_ID: str = ""
+    VOBIZ_AUTH_TOKEN: str = ""
+    VOBIZ_PHONE_NUMBER: str = ""
+    VOBIZ_ANSWER_PATH: str = "/api/v1/telephony/vobiz/answer"
+    VOBIZ_RECORDING_PATH: str = "/api/v1/telephony/vobiz/recording-ready"
+    VOBIZ_MEDIA_PATH: str = "/api/v1/telephony/vobiz/media"
+    VOBIZ_REQUEST_TIMEOUT_SECONDS: float = 15.0
+    TELEPHONY_WEBHOOK_SECRET: str = ""
+    TELEPHONY_WEBHOOK_HEADER: str = "X-Telephony-Signature"
+    VOBIZ_WEBHOOK_SECRET: str = ""
+    PIPECAT_LLM_PROVIDER: str = "gemini"
+    PIPECAT_LLM_MODEL: str = ""
+    PIPECAT_STT_PROVIDER: str = "gemini"
+    PIPECAT_TTS_PROVIDER: str = "gemini"
+    PIPECAT_STT_MODEL: str = "gpt-4o-mini-transcribe"
+    PIPECAT_TTS_MODEL: str = "gpt-4o-mini-tts"
+    PIPECAT_TTS_VOICE: str = "alloy"
 
     # Resume pipeline
     RESUME_MAX_FILE_COUNT: int = 500

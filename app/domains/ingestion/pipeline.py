@@ -23,7 +23,8 @@ async def run_document_pipeline(
     extract_fields: FieldExtractor,
     process_fields: DocumentProcessor,
 ) -> str:
-    """Run generic file validation, text extraction, field extraction, and processing."""
+    """Run generic file validation, text extraction, field extraction, and processing.
+    process_fields - function to further process the extracted fields"""
     if not validate_magic_bytes(data, extension):
         raise IngestionPipelineError("File content does not match its extension.")
 

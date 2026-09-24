@@ -2,7 +2,7 @@
 Async Redis connection pool — singleton for the application lifetime.
 
 Usage in routes:  ``request.app.state.redis``
-Usage in worker:  call ``get_redis_pool()`` directly.
+Usage in worker:  call ``get_redis_client()`` directly.
 """
 
 from redis.asyncio import Redis, ConnectionPool
@@ -23,7 +23,7 @@ def _build_pool() -> ConnectionPool:
     return _pool
 
 
-async def get_redis_pool() -> Redis:
+async def get_redis_client() -> Redis:
     """Return a Redis client backed by the shared connection pool."""
     return Redis(connection_pool=_build_pool())
 

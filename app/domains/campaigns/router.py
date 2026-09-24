@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from uuid6 import uuid7
 
 from app.core.database import get_db
-from app.core.redis import get_redis_pool
+from app.core.redis import get_redis_client
 from app.domains.auth.dependencies import get_current_user
 from app.domains.campaigns.models import (
     Campaign,
@@ -30,12 +30,15 @@ from app.domains.campaigns.schemas import (
     CandidateResponse,
     ScreeningBatchResponse,
     ScreeningRequest,
+    CallingRequest,
+    CallingBatchResponse,
 )
 from app.domains.campaigns.service import (
     build_campaign_raw_text,
     create_batch_tracker,
     enqueue_document_upload_batch,
     enqueue_campaign_screening,
+    enqueue_campaign_calling,
     extract_campaign_requirements_llm,
     get_batch_status,
     stage_files_to_s3,
@@ -223,7 +226,7 @@ async def upload_candidates(
     )
     await db.commit()
 
-    redis = await get_redis_pool()
+    redis = await get_redis_client()
     try:
         await create_batch_tracker(redis, batch_id, file_count=len(files))
         await enqueue_document_upload_batch(
@@ -303,7 +306,7 @@ async def retry_failed_upload(
     batch.status = IngestionBatchStatus.QUEUED
     await db.commit()
 
-    redis = await get_redis_pool()
+    redis = await get_redis_client()
     try:
         await create_batch_tracker(redis, batch_id, file_count=len(retry_items))
         await enqueue_document_upload_batch(
@@ -343,7 +346,7 @@ async def batch_status(
     if campaign_result.scalar_one_or_none() is None:
         raise HTTPException(status_code=404, detail="Campaign not found.")
 
-    redis = await get_redis_pool()
+    redis = await get_redis_client()
     try:
         data = await get_batch_status(redis, batch_id)
     finally:
@@ -443,7 +446,7 @@ async def screen_candidates(
         raise HTTPException(status_code=404, detail="Campaign not found.")
 
     batch_id = f"screen_{uuid7()}"
-    redis = await get_redis_pool()
+    redis = await get_redis_client()
     try:
         await create_batch_tracker(redis, batch_id, file_count=0)
         candidate_ids_str = [str(cid) for cid in request.candidate_ids] if request.candidate_ids else None
@@ -471,7 +474,7 @@ async def screening_batch_status(
     batch_id: str,
     current_user: User = Depends(get_current_user),
 ):
-    redis = await get_redis_pool()
+    redis = await get_redis_client()
     try:
         data = await get_batch_status(redis, batch_id)
     finally:
@@ -491,20 +494,72 @@ async def screening_batch_status(
         finished_at=data.get("finished_at"),
     )
 
-# -----------------------------------------------------------------------
-# Webhooks
-# -----------------------------------------------------------------------
-
-from app.domains.campaigns.schemas import CallWebhookPayload
-from app.domains.campaigns.service import process_call_webhook
-
-@router.post("/webhooks/call-completed", status_code=status.HTTP_200_OK)
-async def call_completed_webhook(
-    payload: CallWebhookPayload,
+@router.post(
+    "/{campaign_id}/candidates/call",
+    response_model=CallingBatchResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def call_candidates(
+    campaign_id: UUID,
+    request: CallingRequest,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
-    """
-    Webhook endpoint to receive call completion data from Voice Provider (e.g. Vobiz).
-    """
-    await process_call_webhook(db, payload)
-    return {"status": "ok"}
+    result = await db.execute(
+        select(Campaign).where(
+            Campaign.id == campaign_id,
+            Campaign.created_by_user_id == current_user.id,
+        )
+    )
+    if not result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Campaign not found.")
+
+    batch_id = f"call_{uuid7()}"
+    redis = await get_redis_client()
+    try:
+        await create_batch_tracker(redis, batch_id, file_count=0)
+        candidate_ids_str = [str(cid) for cid in request.candidate_ids] if request.candidate_ids else None
+
+        await enqueue_campaign_calling(
+            redis,
+            batch_id=batch_id,
+            campaign_id=str(campaign_id),
+            candidate_ids=candidate_ids_str,
+        )
+    finally:
+        await redis.aclose()
+
+    return CallingBatchResponse(
+        batch_id=batch_id,
+        status="QUEUED",
+    )
+
+
+@router.get(
+    "/{campaign_id}/candidates/call/{batch_id}/status",
+    response_model=BatchStatusResponse,
+)
+async def calling_batch_status(
+    campaign_id: UUID,
+    batch_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    redis = await get_redis_client()
+    try:
+        data = await get_batch_status(redis, batch_id)
+    finally:
+        await redis.aclose()
+
+    if data is None:
+        raise HTTPException(status_code=404, detail="Batch not found.")
+
+    return BatchStatusResponse(
+        batch_id=batch_id,
+        status=data.get("status", "UNKNOWN"),
+        total_files=int(data.get("total_files", 0)),
+        processed=int(data.get("processed", 0)),
+        failed=int(data.get("failed", 0)),
+        created_at=data.get("created_at"),
+        updated_at=data.get("updated_at"),
+        finished_at=data.get("finished_at"),
+    )

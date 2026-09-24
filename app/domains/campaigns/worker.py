@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
-from app.core.redis import get_redis_pool
+from app.core.redis import get_redis_client
 from app.core.s3 import download_s3_prefix, upload_bytes_to_s3
 from app.domains.campaigns.models import (
     Candidate,
@@ -34,6 +34,8 @@ from app.domains.campaigns.service import (
     screen_document_llm,
 )
 from app.domains.campaigns.orchestrator import on_step_completed
+from app.domains.telephony.schemas import CallInitiationRequest
+from app.domains.telephony.service import initiate_outbound_call
 from app.domains.ingestion.files import collect_processable_files
 from app.domains.ingestion.models import IngestionBatch, IngestionItem, IngestionItemStatus
 from app.domains.ingestion.pipeline import run_document_pipeline
@@ -49,7 +51,7 @@ async def process_document_upload_batch(
     s3_prefix: str,
     source_type: str,
 ) -> dict[str, Any]:
-    redis = await get_redis_pool()
+    redis = await get_redis_client()
     tmp_dir: Path | None = None
 
     try:
@@ -235,7 +237,7 @@ async def screen_campaign_candidates(
     campaign_id: str,
     candidate_ids: list[str] | None = None,
 ) -> dict[str, Any]:
-    redis = await get_redis_pool()
+    redis = await get_redis_client()
 
     try:
         await update_batch_progress(redis, batch_id, status="PROCESSING")
@@ -304,75 +306,126 @@ async def screen_campaign_candidates(
         await redis.aclose()
 
 
-async def task_initiate_outbound_call(
+
+async def call_campaign_candidates(
     ctx: dict[str, Any],
-    candidate_id: UUID,
+    batch_id: str,
+    campaign_id: str,
+    candidate_ids: list[str] | None = None,
 ) -> dict[str, Any]:
-    from app.integrations.voice.factory import VoiceFactory
+    """Batch ARQ task that initiates outbound calls for a campaign.
 
-    redis = await get_redis_pool()
+    Candidates are processed sequentially. Before each call is initiated the
+    worker checks the ``campaign_active_calls:{campaign_id}`` Redis set.  When
+    the set is at capacity the worker sleeps in a tight poll loop (5 s) until a
+    slot opens — matching the requirement that calls happen only when there is a
+    free slot rather than failing.
+
+    The DB session is kept **outside** the sleep loop so we never hold an open
+    connection while blocking.
+    """
+    redis = await get_redis_client()
     try:
+        await update_batch_progress(redis, batch_id, status="PROCESSING")
+
+        # ── 1. Fetch campaign + candidate list, then close the session ────────
         async with AsyncSessionLocal() as db:
-            result = await db.execute(select(Candidate).where(Candidate.id == candidate_id))
-            candidate = result.scalar_one_or_none()
-            if not candidate:
-                logger.error(f"Candidate {candidate_id} not found.")
-                return {"status": "FAILED", "reason": "Candidate not found"}
-
-            result = await db.execute(select(Campaign).where(Campaign.id == candidate.campaign_id))
-            campaign = result.scalar_one_or_none()
+            campaign_result = await db.execute(
+                select(Campaign).where(Campaign.id == UUID(campaign_id))
+            )
+            campaign = campaign_result.scalar_one_or_none()
             if not campaign:
-                return {"status": "FAILED", "reason": "Campaign not found"}
+                await fail_batch(redis, batch_id, "Campaign not found.")
+                return {"batch_id": batch_id, "status": "FAILED"}
 
-            # Concurrency check: limit simultaneous outbound calls per campaign
-            from sqlalchemy import func
-            count_result = await db.execute(
-                select(func.count(Candidate.id)).where(
-                    Candidate.campaign_id == campaign.id,
-                    Candidate.step_status == WorkflowStepStatus.IN_PROGRESS,
-                    Candidate.workflow_step == "outbound_call"
-                )
+            query = select(Candidate).where(
+                Candidate.campaign_id == UUID(campaign_id),
+                Candidate.phone.isnot(None),
             )
-            active_calls = count_result.scalar_one_or_none() or 0
+            if candidate_ids:
+                query = query.where(Candidate.id.in_([UUID(cid) for cid in candidate_ids]))
 
-            max_concurrent = 3
-            if active_calls >= max_concurrent:
-                logger.info(
-                    "Campaign %s reached max concurrent calls (%s/%s). Delaying candidate %s.",
-                    campaign.id, active_calls, max_concurrent, candidate_id,
+            candidates_result = await db.execute(query)
+            candidates = candidates_result.scalars().all()
+
+        if not candidates:
+            # Not an error — may simply mean all candidates already called.
+            await complete_batch(redis, batch_id)
+            return {"batch_id": batch_id, "status": "COMPLETED", "initiated_count": 0}
+
+        await update_batch_progress(redis, batch_id, total_files=len(candidates))
+
+        # ── 2. Pace calls according to concurrency limit ──────────────────────
+        initiated_count = 0
+        max_concurrent: int = 3
+        redis_key = f"campaign_active_calls:{campaign.id}"
+        slot_acquired = False  # track whether we need to expire after first add
+
+        for candidate in candidates:
+            # Skip candidates that completed or are already in-flight.
+            if candidate.workflow_step == "outbound_call" and candidate.step_status in (
+                WorkflowStepStatus.COMPLETED,
+                WorkflowStepStatus.IN_PROGRESS,
+            ):
+                await update_batch_progress(redis, batch_id, processed_incr=1)
+                continue
+
+            # Wait until a concurrency slot is free — DB session is NOT open here.
+            while True:
+                active_calls = await redis.scard(redis_key)
+                if active_calls < max_concurrent:
+                    break
+                logger.debug(
+                    "Batch %s: campaign %s at capacity (%s/%s), waiting…",
+                    batch_id, campaign.id, active_calls, max_concurrent,
                 )
-                from arq import Retry
-                raise Retry(defer=60)
+                await asyncio.sleep(5)
 
-            candidate.step_status = WorkflowStepStatus.IN_PROGRESS
-            candidate.workflow_step = "outbound_call"
-            await db.commit()
+            try:
+                # Reserve the slot atomically before opening the DB session.
+                await redis.sadd(redis_key, str(candidate.id))
+                if not slot_acquired:
+                    # Set a safety-net TTL once; subsequent calls keep the key alive.
+                    await redis.expire(redis_key, 3600)
+                    slot_acquired = True
 
-            provider = VoiceFactory.get_provider()
+                async with AsyncSessionLocal() as db:
+                    # Re-fetch to get a fresh, attached instance.
+                    refreshed = await db.get(Candidate, candidate.id)
+                    if refreshed is None:
+                        logger.warning("Batch %s: candidate %s vanished, skipping.", batch_id, candidate.id)
+                        await redis.srem(redis_key, str(candidate.id))
+                        await update_batch_progress(redis, batch_id, failed_incr=1)
+                        continue
 
-            system_prompt = f"Objective: Conduct an interview.\nRequirements: {campaign.required_fields}\nContext: {campaign.raw_text}"
-            phone = candidate.phone or ""
+                    refreshed.step_status = WorkflowStepStatus.IN_PROGRESS
+                    refreshed.workflow_step = "outbound_call"
+                    await db.commit()
 
-            if not phone:
-                candidate.step_status = WorkflowStepStatus.FAILED
-                await db.commit()
-                return {"status": "FAILED", "reason": "Candidate has no phone number"}
+                request = CallInitiationRequest(
+                    candidate_id=candidate.id,
+                    campaign_id=campaign.id,
+                    candidate_phone=candidate.phone,
+                    required_fields=campaign.required_fields or {},
+                    raw_text=campaign.raw_text,
+                )
+                await initiate_outbound_call(request)
 
-            call_id = await provider.initiate_call(
-                candidate_phone=phone,
-                candidate_id=candidate.id,
-                campaign_id=campaign.id,
-                system_prompt=system_prompt,
-            )
+                initiated_count += 1
+                await update_batch_progress(redis, batch_id, processed_incr=1)
 
-            return {"status": "SUCCESS", "call_id": call_id}
+            except Exception:
+                logger.exception("Batch %s: calling error for candidate %s", batch_id, candidate.id)
+                # Release the slot so the campaign doesn't get stuck at max_concurrent.
+                await redis.srem(redis_key, str(candidate.id))
+                await update_batch_progress(redis, batch_id, failed_incr=1)
+
+        await complete_batch(redis, batch_id)
+        return {"batch_id": batch_id, "status": "COMPLETED", "initiated_count": initiated_count}
 
     except Exception as exc:
-        # Let ARQ's Retry exception propagate unchanged
-        if type(exc).__name__ == "Retry":
-            raise
-
-        logger.exception("Error initiating outbound call for candidate %s", candidate_id)
-        return {"status": "FAILED", "reason": str(exc)}
+        logger.exception("Batch %s: calling unhandled error", batch_id)
+        await fail_batch(redis, batch_id, str(exc))
+        return {"batch_id": batch_id, "status": "FAILED", "reason": str(exc)}
     finally:
         await redis.aclose()
