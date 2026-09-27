@@ -65,7 +65,7 @@ async def process_document_upload_batch(
             await fail_batch(redis, batch_id, "No processable files found after download.")
             return {"batch_id": batch_id, "status": "FAILED", "reason": "no files"}
 
-        await update_batch_progress(redis, batch_id, total_files=len(files))
+        await update_batch_progress(redis, batch_id, total_candidates=len(files))
 
         ingestion_batch_id = UUID(batch_id.removeprefix("batch_"))
 
@@ -218,7 +218,7 @@ async def process_document_upload_batch(
                 batch_status = "PARTIAL"
 
         await complete_batch(redis, batch_id, status=batch_status)
-        return {"batch_id": batch_id, "status": "COMPLETED", "total_files": len(files)}
+        return {"batch_id": batch_id, "status": "COMPLETED", "total_candidates": len(files)}
 
     except Exception as exc:
         logger.exception("Batch %s: unhandled error", batch_id)
@@ -263,7 +263,7 @@ async def screen_campaign_candidates(
                 await fail_batch(redis, batch_id, "No eligible candidates found.")
                 return {"batch_id": batch_id, "status": "FAILED"}
 
-            await update_batch_progress(redis, batch_id, total_files=len(candidates))
+            await update_batch_progress(redis, batch_id, total_candidates=len(candidates))
 
             screened_count = 0
             for candidate in candidates:
@@ -353,7 +353,7 @@ async def call_campaign_candidates(
             await complete_batch(redis, batch_id)
             return {"batch_id": batch_id, "status": "COMPLETED", "initiated_count": 0}
 
-        await update_batch_progress(redis, batch_id, total_files=len(candidates))
+        await update_batch_progress(redis, batch_id, total_candidates=len(candidates))
 
         # ── 2. Pace calls according to concurrency limit ──────────────────────
         initiated_count = 0

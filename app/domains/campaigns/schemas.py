@@ -91,8 +91,8 @@ class CallWebhookPayload(BaseModel):
 class BatchUploadResponse(BaseModel):
     batch_id: str
     status: str
-    accepted_files: int
-    rejected_files: int
+    accepted_candidates: int
+    rejected_candidates: int
 
 
 class CampaignFieldsUpdate(BaseModel):
@@ -103,14 +103,13 @@ class CampaignFieldsUpdate(BaseModel):
 class BatchStatusResponse(BaseModel):
     batch_id: str
     status: str
-    total_files: int
+    total_candidates: int
     processed: int
     failed: int
     created_at: str | None = None
     updated_at: str | None = None
     finished_at: str | None = None
-    failed_files: list[str] = Field(default_factory=list)
-    candidates: list[CandidateResponse] | None = None
+    failed_candidates: list[str] = Field(default_factory=list)
 
 
 class ScreeningRequest(BaseModel):

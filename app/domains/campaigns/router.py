@@ -92,6 +92,7 @@ async def create_campaign(
 @router.patch("/{campaign_id}", response_model=CampaignResponse)
 async def update_campaign(
     campaign_id: UUID,
+    title: str = Form(...),
     raw_text: str | None = Form(None),
     file: UploadFile | None = File(None),
     db: AsyncSession = Depends(get_db),
@@ -113,6 +114,9 @@ async def update_campaign(
         campaign.required_fields = await extract_campaign_requirements_llm(
             campaign.raw_text,
         )
+
+    if title:
+        campaign.title = title
 
     await db.commit()
     await db.refresh(campaign)
@@ -242,8 +246,8 @@ async def upload_candidates(
     return BatchUploadResponse(
         batch_id=batch_id,
         status="QUEUED",
-        accepted_files=len(valid_files),
-        rejected_files=len(invalid_files)
+        accepted_candidates=len(valid_files),
+        rejected_candidates=len(invalid_files)
     )
 
 
@@ -322,8 +326,8 @@ async def retry_failed_upload(
     return BatchUploadResponse(
         batch_id=batch_id,
         status="QUEUED",
-        accepted_files=len(retry_items),
-        rejected_files=0,
+        accepted_candidates=len(retry_items),
+        rejected_candidates=0,
     )
 
 
@@ -356,8 +360,7 @@ async def batch_status(
         raise HTTPException(status_code=404, detail="Batch not found.")
 
     status_val = data.get("status", "UNKNOWN")
-    candidates = None
-    failed_files: list[str] = []
+    failed_candidates: list[str] = []
 
     try:
         ingestion_batch_id = UUID(batch_id.removeprefix("batch_"))
@@ -369,30 +372,20 @@ async def batch_status(
                 ),
             )
         )
-        failed_files = list(failed_result.scalars().all())
+        failed_candidates = list(failed_result.scalars().all())
     except ValueError:
         pass
-
-    if status_val == "COMPLETED":
-        result = await db.execute(
-            select(Candidate).where(
-                Candidate.campaign_id == campaign_id,
-                Candidate.workflow_step == "document_extraction"
-            )
-        )
-        candidates = result.scalars().all()
 
     return BatchStatusResponse(
         batch_id=batch_id,
         status=status_val,
-        total_files=int(data.get("total_files", 0)),
+        total_candidates=int(data.get("total_candidates", 0)),
         processed=int(data.get("processed", 0)),
         failed=int(data.get("failed", 0)),
         created_at=data.get("created_at"),
         updated_at=data.get("updated_at"),
         finished_at=data.get("finished_at"),
-        failed_files=failed_files,
-        candidates=candidates,
+        failed_candidates=failed_candidates
     )
 
 
@@ -486,7 +479,7 @@ async def screening_batch_status(
     return BatchStatusResponse(
         batch_id=batch_id,
         status=data.get("status", "UNKNOWN"),
-        total_files=int(data.get("total_files", 0)),
+        total_candidates=int(data.get("total_candidates", 0)),
         processed=int(data.get("processed", 0)),
         failed=int(data.get("failed", 0)),
         created_at=data.get("created_at"),
@@ -556,7 +549,7 @@ async def calling_batch_status(
     return BatchStatusResponse(
         batch_id=batch_id,
         status=data.get("status", "UNKNOWN"),
-        total_files=int(data.get("total_files", 0)),
+        total_candidates=int(data.get("total_candidates", 0)),
         processed=int(data.get("processed", 0)),
         failed=int(data.get("failed", 0)),
         created_at=data.get("created_at"),

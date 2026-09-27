@@ -212,7 +212,7 @@ async def create_batch_tracker(redis: Redis, batch_id: str, file_count: int) -> 
         f"job:{batch_id}",
         mapping={
             "status": "QUEUED",
-            "total_files": str(file_count),
+            "total_candidates": str(file_count),
             "processed": "0",
             "failed": "0",
             "created_at": now,
@@ -226,14 +226,14 @@ async def update_batch_progress(
     redis: Redis,
     batch_id: str,
     *,
-    total_files: int | None = None,
+    total_candidates: int | None = None,
     processed_incr: int = 0,
     failed_incr: int = 0,
     status: str | None = None,
 ) -> None:
     pipe = redis.pipeline(transaction=True)
-    if total_files is not None:
-        pipe.hset(f"job:{batch_id}", "total_files", str(total_files))
+    if total_candidates is not None:
+        pipe.hset(f"job:{batch_id}", "total_candidates", str(total_candidates))
     if processed_incr:
         pipe.hincrby(f"job:{batch_id}", "processed", processed_incr)
     if failed_incr:
