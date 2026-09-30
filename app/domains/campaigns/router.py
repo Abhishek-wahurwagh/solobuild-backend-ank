@@ -32,6 +32,7 @@ from app.domains.campaigns.schemas import (
     ScreeningRequest,
     CallingRequest,
     CallingBatchResponse,
+    CallingBatchControlResponse,
 )
 from app.domains.campaigns.service import (
     build_campaign_raw_text,
@@ -43,7 +44,9 @@ from app.domains.campaigns.service import (
     get_batch_status,
     stage_files_to_s3,
     validate_document_uploads,
-    extract_document_fields_llm
+    extract_document_fields_llm,
+    pause_calling_batch,
+    resume_calling_batch,
 )
 from app.domains.ingestion.service import create_ingestion_batch
 from app.domains.ingestion.models import (
@@ -507,11 +510,26 @@ async def call_candidates(
     if not result.scalar_one_or_none():
         raise HTTPException(status_code=404, detail="Campaign not found.")
 
+    # Mark candidates as outbound_call / PENDING in the DB
+    candidate_query = select(Candidate).where(
+        Candidate.campaign_id == campaign_id,
+        Candidate.phone.isnot(None),
+    )
+    if request.candidate_ids:
+        candidate_query = candidate_query.where(Candidate.id.in_(request.candidate_ids))
+
+    candidate_results = await db.execute(candidate_query)
+    candidates = candidate_results.scalars().all()
+    for candidate in candidates:
+        candidate.workflow_step = "outbound_call"
+        candidate.step_status = WorkflowStepStatus.PENDING
+    await db.commit()
+
     batch_id = f"call_{uuid7()}"
     redis = await get_redis_client()
     try:
-        await create_batch_tracker(redis, batch_id, file_count=0)
-        candidate_ids_str = [str(cid) for cid in request.candidate_ids] if request.candidate_ids else None
+        await create_batch_tracker(redis, batch_id, file_count=len(candidates))
+        candidate_ids_str = [str(c.id) for c in candidates] if candidates else None
 
         await enqueue_campaign_calling(
             redis,
@@ -556,3 +574,81 @@ async def calling_batch_status(
         updated_at=data.get("updated_at"),
         finished_at=data.get("finished_at"),
     )
+
+
+@router.post(
+    "/{campaign_id}/candidates/call/{batch_id}/pause",
+    response_model=CallingBatchControlResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def pause_calling(
+    campaign_id: UUID,
+    batch_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Pause an in-progress calling batch. Updates uncalled candidates in DB to PAUSED
+    and cleanly stops worker dispatching."""
+    result = await db.execute(
+        select(Campaign).where(
+            Campaign.id == campaign_id,
+            Campaign.created_by_user_id == current_user.id,
+        )
+    )
+    if not result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Campaign not found.")
+
+    redis = await get_redis_client()
+    try:
+        data = await get_batch_status(redis, batch_id)
+        if data is None:
+            raise HTTPException(status_code=404, detail="Batch not found.")
+        if data.get("status") not in ("PROCESSING", "QUEUED"):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot pause a batch in '{data.get('status')}' state.",
+            )
+        await pause_calling_batch(db, redis, batch_id=batch_id, campaign_id=campaign_id)
+    finally:
+        await redis.aclose()
+
+    return CallingBatchControlResponse(batch_id=batch_id, status="PAUSED")
+
+
+@router.post(
+    "/{campaign_id}/candidates/call/{batch_id}/resume",
+    response_model=CallingBatchControlResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def resume_calling(
+    campaign_id: UUID,
+    batch_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Resume a previously paused calling batch. Resets PAUSED candidates to PENDING
+    and re-enqueues calling in ARQ."""
+    result = await db.execute(
+        select(Campaign).where(
+            Campaign.id == campaign_id,
+            Campaign.created_by_user_id == current_user.id,
+        )
+    )
+    if not result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Campaign not found.")
+
+    redis = await get_redis_client()
+    try:
+        data = await get_batch_status(redis, batch_id)
+        if data is None:
+            raise HTTPException(status_code=404, detail="Batch not found.")
+        if data.get("status") != "PAUSED":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot resume a batch in '{data.get('status')}' state.",
+            )
+        await resume_calling_batch(db, redis, batch_id=batch_id, campaign_id=campaign_id)
+    finally:
+        await redis.aclose()
+
+    return CallingBatchControlResponse(batch_id=batch_id, status="PROCESSING")

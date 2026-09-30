@@ -125,3 +125,8 @@ class CallingRequest(BaseModel):
 class CallingBatchResponse(BaseModel):
     batch_id: str
     status: str
+
+class CallingBatchControlResponse(BaseModel):
+    """Response for pause / resume actions on a calling batch."""
+    batch_id: str
+    status: str

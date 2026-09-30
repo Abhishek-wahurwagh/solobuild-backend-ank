@@ -15,6 +15,7 @@ class WorkflowStepStatus(str, enum.Enum):
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     READY_FOR_ACTION = "READY_FOR_ACTION"
+    PAUSED = "PAUSED"
 
 
 class WorkflowTemplate(Base):

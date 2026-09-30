@@ -10,8 +10,8 @@ Contains:
 - Generic LLM Screening
 - Call webhook processing
 """
-
 from __future__ import annotations
+from click import UUID
 
 import asyncio
 import io
@@ -340,6 +340,82 @@ async def enqueue_campaign_calling(
     await pool.aclose()
 
 
+# ---- Pause / Resume helpers ------------------------------------------------
+
+CALL_PAUSE_KEY = "campaign_call_paused:{campaign_id}"
+
+
+async def pause_calling_batch(
+    db: AsyncSession,
+    redis: Redis,
+    *,
+    batch_id: str,
+    campaign_id: UUID,
+) -> int:
+    """Set the pause flag for a campaign's calling batch and update uncalled candidates to PAUSED."""
+    key = CALL_PAUSE_KEY.format(campaign_id=str(campaign_id))
+    await redis.set(key, "1", ex=86400)  # auto-expire after 24 h as a safety net
+    await update_batch_progress(redis, batch_id, status="PAUSED")
+
+    # Mark all candidates that are currently pending/ready for calling in this campaign as PAUSED
+    stmt = (
+        select(Candidate)
+        .where(
+            Candidate.campaign_id == campaign_id,
+            Candidate.workflow_step == "outbound_call",
+            Candidate.step_status.in_([WorkflowStepStatus.PENDING, WorkflowStepStatus.READY_FOR_ACTION]),
+        )
+    )
+    result = await db.execute(stmt)
+    candidates = result.scalars().all()
+    for candidate in candidates:
+        candidate.step_status = WorkflowStepStatus.PAUSED
+
+    await db.commit()
+    return len(candidates)
+
+
+async def resume_calling_batch(
+    db: AsyncSession,
+    redis: Redis,
+    *,
+    batch_id: str,
+    campaign_id: UUID,
+) -> int:
+    """Clear the pause flag, reset paused candidates to PENDING, and re-enqueue calling."""
+    key = CALL_PAUSE_KEY.format(campaign_id=str(campaign_id))
+    await redis.delete(key)
+    await update_batch_progress(redis, batch_id, status="PROCESSING")
+
+    # Find candidates that were paused
+    stmt = (
+        select(Candidate)
+        .where(
+            Candidate.campaign_id == campaign_id,
+            Candidate.workflow_step == "outbound_call",
+            Candidate.step_status == WorkflowStepStatus.PAUSED,
+        )
+    )
+    result = await db.execute(stmt)
+    candidates = result.scalars().all()
+    candidate_ids = [str(c.id) for c in candidates]
+
+    for candidate in candidates:
+        candidate.step_status = WorkflowStepStatus.PENDING
+
+    await db.commit()
+
+    if candidate_ids:
+        await enqueue_campaign_calling(
+            redis,
+            batch_id=batch_id,
+            campaign_id=str(campaign_id),
+            candidate_ids=candidate_ids,
+        )
+
+    return len(candidates)
+
+
 # =========================================================================
 # TEXT EXTRACTION
 # =========================================================================
@@ -596,6 +672,6 @@ async def process_call_webhook(payload: CallWebhookPayload) -> None:
     # Clean up Redis concurrency tracker
     redis = await get_redis_client()
     try:
-        await redis.srem(f"campaign_active_calls:{payload.campaign_id}", str(payload.candidate_id))
+        await redis.srem(f"campaign_active_calls:{payload.campaign_id}", str(payload.candidate_id)) # type: ignore
     finally:
-        await redis.aclose()
+        await redis.aclose()

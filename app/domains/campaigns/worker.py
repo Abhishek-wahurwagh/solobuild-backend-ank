@@ -32,6 +32,7 @@ from app.domains.campaigns.service import (
     extract_document_fields_llm,
     persist_candidate_from_ingestion,
     screen_document_llm,
+    CALL_PAUSE_KEY,
 )
 from app.domains.campaigns.orchestrator import on_step_completed
 from app.domains.telephony.schemas import CallInitiationRequest
@@ -370,20 +371,36 @@ async def call_campaign_candidates(
                 await update_batch_progress(redis, batch_id, processed_incr=1)
                 continue
 
+            # ── Pause check — if paused, exit worker cleanly without holding thread ──
+            pause_key = CALL_PAUSE_KEY.format(campaign_id=campaign_id)
+            if await redis.exists(pause_key):
+                logger.info(
+                    "Batch %s: campaign %s is PAUSED, exiting worker cleanly.",
+                    batch_id, campaign.id,
+                )
+                return {"batch_id": batch_id, "status": "PAUSED", "initiated_count": initiated_count}
+
             # Wait until a concurrency slot is free — DB session is NOT open here.
             while True:
-                active_calls = await redis.scard(redis_key)
+                if await redis.exists(pause_key):
+                    logger.info(
+                        "Batch %s: campaign %s became PAUSED while waiting for slot, exiting.",
+                        batch_id, campaign.id,
+                    )
+                    return {"batch_id": batch_id, "status": "PAUSED", "initiated_count": initiated_count}
+
+                active_calls = await redis.scard(redis_key) #type: ignore
                 if active_calls < max_concurrent:
                     break
                 logger.debug(
                     "Batch %s: campaign %s at capacity (%s/%s), waiting…",
                     batch_id, campaign.id, active_calls, max_concurrent,
                 )
-                await asyncio.sleep(5)
+                await asyncio.sleep(2)
 
             try:
                 # Reserve the slot atomically before opening the DB session.
-                await redis.sadd(redis_key, str(candidate.id))
+                await redis.sadd(redis_key, str(candidate.id)) #type: ignore
                 if not slot_acquired:
                     # Set a safety-net TTL once; subsequent calls keep the key alive.
                     await redis.expire(redis_key, 3600)
@@ -394,7 +411,7 @@ async def call_campaign_candidates(
                     refreshed = await db.get(Candidate, candidate.id)
                     if refreshed is None:
                         logger.warning("Batch %s: candidate %s vanished, skipping.", batch_id, candidate.id)
-                        await redis.srem(redis_key, str(candidate.id))
+                        await redis.srem(redis_key, str(candidate.id)) #type: ignore
                         await update_batch_progress(redis, batch_id, failed_incr=1)
                         continue
 
@@ -417,7 +434,7 @@ async def call_campaign_candidates(
             except Exception:
                 logger.exception("Batch %s: calling error for candidate %s", batch_id, candidate.id)
                 # Release the slot so the campaign doesn't get stuck at max_concurrent.
-                await redis.srem(redis_key, str(candidate.id))
+                await redis.srem(redis_key, str(candidate.id)) #type: ignore
                 await update_batch_progress(redis, batch_id, failed_incr=1)
 
         await complete_batch(redis, batch_id)
