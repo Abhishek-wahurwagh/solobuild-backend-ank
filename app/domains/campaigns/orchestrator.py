@@ -19,19 +19,21 @@ from app.core.redis import get_redis_client
 
 logger = logging.getLogger("solo.orchestrator")
 
-# A mapping of service names to their background task names in ARQ
+# A mapping of service names to their background dispatcher task names in ARQ.
+# Each dispatcher fans out one atomic task per candidate, so passing a single
+# candidate_id here results in exactly one atomic worker being queued.
 SERVICE_TO_TASK_MAP = {
-    "document_screening": "screen_campaign_candidates",
-    "outbound_call": "call_campaign_candidates",
+    "document_screening": "dispatch_campaign_screening",
+    "outbound_call": "dispatch_campaign_calling",
 }
 
 async def enqueue_workflow_task(*, task_name: str, campaign_id: UUID, candidate_id: UUID | None = None) -> None:
-    """Enqueue a workflow task in ARQ using the app Redis connection."""
+    """Enqueue a workflow dispatcher task in ARQ using the app Redis connection."""
     pool = await create_pool(RedisSettings.from_dsn(settings.REDIS_URL))
     try:
-        if task_name in ("screen_campaign_candidates", "call_campaign_candidates"):
-            from uuid import uuid7
-            prefix = "call" if task_name == "call_campaign_candidates" else "screen"
+        if task_name in ("dispatch_campaign_screening", "dispatch_campaign_calling"):
+            from uuid6 import uuid7
+            prefix = "call" if task_name == "dispatch_campaign_calling" else "screen"
             await pool.enqueue_job(
                 task_name,
                 batch_id=f"{prefix}_{uuid7()}",

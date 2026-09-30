@@ -206,6 +206,10 @@ async def stage_files_to_s3(
 # REDIS BATCH TRACKER
 # =========================================================================
 
+_BATCH_PENDING_KEY = "campaign:{batch_id}:pending"
+_BATCH_TTL = 7 * 86400  # 7 days
+
+
 async def create_batch_tracker(redis: Redis, batch_id: str, file_count: int) -> None:
     now = datetime.now(timezone.utc).isoformat()
     await redis.hset(  # type: ignore
@@ -219,7 +223,7 @@ async def create_batch_tracker(redis: Redis, batch_id: str, file_count: int) -> 
             "updated_at": now,
         },
     )
-    await redis.expire(f"job:{batch_id}", 7 * 86400)
+    await redis.expire(f"job:{batch_id}", _BATCH_TTL)
 
 
 async def update_batch_progress(
@@ -274,6 +278,42 @@ async def get_batch_status(redis: Redis, batch_id: str) -> dict[str, str] | None
     return data or None
 
 
+# ---------------------------------------------------------------------------
+# Redis Set-based atomic completion tracker (Phase 3)
+# ---------------------------------------------------------------------------
+
+async def batch_add_pending(redis: Redis, batch_id: str, item_ids: list[str]) -> None:
+    """Atomically register all pending item IDs into the tracking Set.
+
+    The Set cardinality reaching 0 is the authoritative completion signal.
+    Using a Set (not a counter) prevents double-counting if a task runs twice.
+    """
+    if not item_ids:
+        return
+    key = _BATCH_PENDING_KEY.format(batch_id=batch_id)
+    pipe = redis.pipeline(transaction=True)
+    for item_id in item_ids:
+        pipe.sadd(key, item_id)  # type: ignore
+    pipe.expire(key, _BATCH_TTL)  # type: ignore
+    await pipe.execute()
+
+
+async def batch_mark_done(redis: Redis, batch_id: str, item_id: str) -> bool:
+    """Remove *item_id* from the pending Set.
+
+    Returns ``True`` iff this was the last item (Set is now empty), meaning
+    the caller is responsible for finalising the batch.  Uses Redis SREM +
+    SCARD atomically via a pipeline so exactly one caller gets ``True``.
+    """
+    key = _BATCH_PENDING_KEY.format(batch_id=batch_id)
+    pipe = redis.pipeline(transaction=True)
+    pipe.srem(key, item_id)  # type: ignore
+    pipe.scard(key)  # type: ignore
+    results = await pipe.execute()
+    remaining: int = results[1]
+    return remaining == 0
+
+
 # =========================================================================
 # ARQ JOB ENQUEUE
 # =========================================================================
@@ -290,8 +330,9 @@ async def enqueue_document_upload_batch(
     from arq.connections import RedisSettings
 
     pool = await create_pool(RedisSettings.from_dsn(settings.REDIS_URL))
+    # Dispatcher: fans out individual file tasks inside the worker
     await pool.enqueue_job(
-        "process_document_upload_batch",
+        "dispatch_ingestion_batch",
         batch_id=batch_id,
         campaign_id=campaign_id,
         s3_prefix=s3_prefix,
@@ -311,8 +352,9 @@ async def enqueue_campaign_screening(
     from arq.connections import RedisSettings
 
     pool = await create_pool(RedisSettings.from_dsn(settings.REDIS_URL))
+    # Dispatcher: fans out individual candidate screening tasks inside the worker
     await pool.enqueue_job(
-        "screen_campaign_candidates",
+        "dispatch_campaign_screening",
         batch_id=batch_id,
         campaign_id=campaign_id,
         candidate_ids=candidate_ids,
@@ -331,8 +373,9 @@ async def enqueue_campaign_calling(
     from arq.connections import RedisSettings
 
     pool = await create_pool(RedisSettings.from_dsn(settings.REDIS_URL))
+    # Dispatcher: fans out individual candidate call tasks inside the worker
     await pool.enqueue_job(
-        "call_campaign_candidates",
+        "dispatch_campaign_calling",
         batch_id=batch_id,
         campaign_id=campaign_id,
         candidate_ids=candidate_ids,
@@ -340,10 +383,10 @@ async def enqueue_campaign_calling(
     await pool.aclose()
 
 
-# ---- Pause / Resume helpers ------------------------------------------------
-
-CALL_PAUSE_KEY = "campaign_call_paused:{campaign_id}"
-
+# ---------------------------------------------------------------------------
+# Pause / Resume — pure DB state (Phase 4)
+# Redis flags are no longer used; Campaign.status is the sole authority.
+# ---------------------------------------------------------------------------
 
 async def pause_calling_batch(
     db: AsyncSession,
@@ -352,12 +395,17 @@ async def pause_calling_batch(
     batch_id: str,
     campaign_id: UUID,
 ) -> int:
-    """Set the pause flag for a campaign's calling batch and update uncalled candidates to PAUSED."""
-    key = CALL_PAUSE_KEY.format(campaign_id=str(campaign_id))
-    await redis.set(key, "1", ex=86400)  # auto-expire after 24 h as a safety net
+    """Pause an active calling batch.
+
+    Sets Campaign.status to 'PAUSED' in Postgres.  Atomic workers check this
+    field on every wake-up and exit gracefully without needing a Redis flag.
+    Also marks uncalled candidates as PAUSED so resumption knows which ones
+    still need to be dialled.
+    """
+    # Update Redis tracker for UI visibility
     await update_batch_progress(redis, batch_id, status="PAUSED")
 
-    # Mark all candidates that are currently pending/ready for calling in this campaign as PAUSED
+    # Mark all candidates that are currently pending/ready for calling as PAUSED
     stmt = (
         select(Candidate)
         .where(
@@ -382,9 +430,15 @@ async def resume_calling_batch(
     batch_id: str,
     campaign_id: UUID,
 ) -> int:
-    """Clear the pause flag, reset paused candidates to PENDING, and re-enqueue calling."""
-    key = CALL_PAUSE_KEY.format(campaign_id=str(campaign_id))
-    await redis.delete(key)
+    """Resume a paused calling batch.
+
+    Resets PAUSED candidates back to PENDING in Postgres and fans out new
+    atomic call tasks into ARQ — one per candidate.  No Redis flags to clear.
+    """
+    from arq import create_pool
+    from arq.connections import RedisSettings
+    from uuid6 import uuid7
+
     await update_batch_progress(redis, batch_id, status="PROCESSING")
 
     # Find candidates that were paused
@@ -402,16 +456,26 @@ async def resume_calling_batch(
 
     for candidate in candidates:
         candidate.step_status = WorkflowStepStatus.PENDING
-
     await db.commit()
 
-    if candidate_ids:
-        await enqueue_campaign_calling(
-            redis,
-            batch_id=batch_id,
-            campaign_id=str(campaign_id),
-            candidate_ids=candidate_ids,
-        )
+    if not candidate_ids:
+        return 0
+
+    # Re-initialise the Redis pending Set for the resumed batch
+    await batch_add_pending(redis, batch_id, candidate_ids)
+
+    # Fan out one atomic call task per candidate
+    pool = await create_pool(RedisSettings.from_dsn(settings.REDIS_URL))
+    try:
+        for cid in candidate_ids:
+            await pool.enqueue_job(
+                "call_single_candidate",
+                campaign_id=str(campaign_id),
+                candidate_id=cid,
+                batch_id=batch_id,
+            )
+    finally:
+        await pool.aclose()
 
     return len(candidates)
 
