@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import io
 import re
 import unicodedata
@@ -42,6 +43,42 @@ def extract_text_from_txt(data: bytes) -> str:
     return normalize_text(data.decode("utf-8", errors="replace"))
 
 
+def extract_csv_rows(data: bytes) -> tuple[list[str], list[dict[str, str]]]:
+    """Parse a CSV file and return (headers, rows).
+
+    Tries UTF-8 first, then common fallback encodings.
+    Returns a tuple of:
+    - headers: list of column names (may be empty for header-less CSVs)
+    - rows: list of dicts mapping header -> cell value
+    """
+    for encoding in ("utf-8-sig", "utf-8", "latin-1", "cp1252"):
+        try:
+            text = data.decode(encoding)
+            break
+        except (UnicodeDecodeError, ValueError):
+            continue
+    else:
+        text = data.decode("utf-8", errors="replace")
+
+    reader = csv.DictReader(io.StringIO(text))
+    headers: list[str] = list(reader.fieldnames or [])
+    rows: list[dict[str, str]] = []
+    for row in reader:
+        # Strip whitespace from keys and values
+        cleaned = {k.strip(): (v.strip() if v else "") for k, v in row.items() if k}
+        rows.append(cleaned)
+    return headers, rows
+
+
+def csv_rows_to_text(headers: list[str], rows: list[dict[str, str]]) -> str:
+    """Serialise CSV rows back to a human-readable text block for LLM ingestion."""
+    lines: list[str] = []
+    for i, row in enumerate(rows, start=1):
+        parts = [f"{k}: {v}" for k, v in row.items() if v]
+        lines.append(f"--- Row {i} ---\n" + "\n".join(parts))
+    return "\n\n".join(lines)
+
+
 def extract_document_text(data: bytes, extension: str) -> str | None:
     try:
         if extension == ".pdf":
@@ -50,6 +87,9 @@ def extract_document_text(data: bytes, extension: str) -> str | None:
             return extract_text_from_docx(data)
         if extension == ".txt":
             return extract_text_from_txt(data)
+        if extension == ".csv":
+            headers, rows = extract_csv_rows(data)
+            return csv_rows_to_text(headers, rows)
     except Exception:
         return None
     return None
@@ -68,4 +108,8 @@ def validate_magic_bytes(data: bytes, extension: str) -> bool:
             if byte < 0x09 or (0x0E <= byte <= 0x1F) or byte == 0x7F
         )
         return control <= 2
+    if extension == ".csv":
+        # CSV has no magic-byte signature; accept any non-empty file with
+        # the .csv extension (encoding detection happens during extraction).
+        return len(data) > 0
     return False

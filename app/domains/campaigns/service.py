@@ -51,7 +51,7 @@ from app.domains.ingestion.text import (
 # DOCUMENT UPLOAD VALIDATION
 # =========================================================================
 
-ALLOWED_EXTENSIONS: set[str] = {".pdf", ".docx", ".txt", ".zip"}
+ALLOWED_EXTENSIONS: set[str] = {".pdf", ".docx", ".txt", ".csv", ".zip"}
 
 EXT_TO_MIME: dict[str, set[str]] = {
     ".pdf": {"application/pdf"},
@@ -60,6 +60,7 @@ EXT_TO_MIME: dict[str, set[str]] = {
         "application/zip",
     },
     ".txt": {"text/plain", "application/octet-stream"},
+    ".csv": {"text/csv", "text/plain", "application/vnd.ms-excel", "application/octet-stream"},
     ".zip": {"application/zip", "application/x-zip-compressed", "application/octet-stream"},
 }
 
@@ -164,7 +165,7 @@ async def validate_zip_safety(data: bytes) -> list[str]:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Nested zip found: {name}")
 
         ext = Path(name).suffix.lower()
-        if ext not in {".pdf", ".docx", ".txt"}:
+        if ext not in {".pdf", ".docx", ".txt", ".csv"}:
             continue
 
         safe_names.append(name)
@@ -510,10 +511,10 @@ async def build_campaign_raw_text(
         )
 
     ext = Path(filename).suffix.lower()
-    if ext not in {".pdf", ".docx", ".txt"}:
+    if ext not in {".pdf", ".docx", ".txt", ".csv"}:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Campaign requirement file must be PDF, DOCX, or TXT.",
+            detail="Campaign requirement file must be PDF, DOCX, TXT, or CSV.",
         )
 
     file_bytes = await uploaded_file.read()
@@ -641,6 +642,128 @@ async def persist_candidate_from_ingestion(
     db.add(candidate)
     await db.flush()
     return candidate, True
+
+
+async def extract_candidates_from_csv_llm(
+    csv_text: str,
+    extraction_provider: StructuredExtractionProvider | None = None,
+) -> list[dict[str, Any]]:
+    """Use the LLM to parse a block of CSV text into a list of candidate dicts.
+
+    Each dict should contain at least ``name``, ``email``, and ``phone`` when
+    those fields are present in the CSV.  All other columns are kept verbatim
+    inside ``extracted_fields`` on the candidate.
+
+    The LLM is instructed to return a JSON **array** where every element
+    represents one candidate / data row.
+    """
+    if not csv_text or not csv_text.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="CSV text cannot be empty for candidate extraction.",
+        )
+    if extraction_provider is None:
+        extraction_provider = StructuredExtractionProviderFactory.build()
+
+    # We call into the Gemini client directly via its underlying _generate_content
+    # method so we can supply a custom array-returning prompt, but we keep the
+    # shared retry / timeout logic from the provider.
+    import json, re
+
+    prompt = f"""\
+You are a data extraction assistant.
+You will be given structured text representing one or more rows from a CSV file.
+Each row represents a single candidate (person).
+
+Your task:
+1. Parse each row.
+2. For every row produce a JSON object with these keys:
+   - "name"  : full name of the person (string, or null if missing)
+   - "email" : email address (string, or null if missing)
+   - "phone" : phone / mobile number as a string (or null if missing)
+   - "extracted_fields": a flat JSON object with all remaining non-empty
+     columns as key-value string pairs.
+3. Return a JSON **array** containing one object per row.
+4. Output valid JSON only — no markdown, no prose.
+
+CSV Data:
+{csv_text}
+"""
+
+    try:
+        # Access the underlying Gemini client to get a raw JSON response.
+        raw = await extraction_provider._generate_content(prompt)  # type: ignore[attr-defined]
+        text = getattr(raw, "text", None) or str(raw)
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"AI service is currently unavailable: {exc}",
+        )
+
+    json_text = text.strip()
+    if json_text.startswith("```"):
+        json_text = re.sub(r"^```json\s*", "", json_text, flags=re.IGNORECASE)
+        json_text = re.sub(r"```$", "", json_text).strip()
+
+    try:
+        payload = json.loads(json_text)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"LLM returned invalid JSON for CSV extraction: {exc}",
+        )
+
+    if not isinstance(payload, list):
+        # Tolerate single-object responses by wrapping them
+        if isinstance(payload, dict):
+            payload = [payload]
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="LLM did not return an array of candidates.",
+            )
+
+    return payload
+
+
+async def persist_csv_candidate(
+    db: AsyncSession,
+    *,
+    campaign_id,
+    ingestion_item_id,
+    source_url: str,
+    extracted_fields: dict[str, Any],
+) -> Candidate:
+    """Create a Candidate from a single CSV row.
+
+    Unlike ``persist_candidate_from_ingestion``, multiple candidates can originate
+    from the same parent CSV file. Because ``Candidate.ingestion_item_id`` has a UNIQUE
+    constraint, we do NOT assign ``ingestion_item_id`` directly to avoid collisions;
+    instead we record ``source_ingestion_item_id`` inside ``extracted_fields``.
+    """
+    core_fields = dict(extracted_fields.get("extracted_fields") or {})
+    if ingestion_item_id is not None:
+        core_fields["source_ingestion_item_id"] = str(ingestion_item_id)
+    # Merge top-level known fields into extracted_fields for storage
+    for key in ("name", "email", "phone"):
+        val = extracted_fields.get(key)
+        if val:
+            core_fields[key] = val
+
+    candidate = Candidate(
+        campaign_id=campaign_id,
+        name=extracted_fields.get("name") or "Unknown",
+        email=extracted_fields.get("email"),
+        phone=extracted_fields.get("phone"),
+        file_url=source_url,
+        ingestion_item_id=None,
+        extracted_fields=core_fields,
+        workflow_step="document_extraction",
+        step_status=WorkflowStepStatus.COMPLETED,
+    )
+    db.add(candidate)
+    await db.flush()
+    return candidate
 
 
 # =========================================================================

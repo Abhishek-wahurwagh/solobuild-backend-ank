@@ -57,7 +57,8 @@ class Settings(BaseSettings):
     PIPECAT_TTS_MODEL: str = "gpt-4o-mini-tts"
     PIPECAT_TTS_VOICE: str = "alloy"
 
-    # Resume pipeline
+    # Resume & CSV pipeline
+    CSV_CHUNK_SIZE: int = 50
     RESUME_MAX_FILE_COUNT: int = 500
     ZIP_MAX_UNCOMPRESSED_BYTES: int = 500 * 1024 * 1024
     ZIP_MAX_RATIO: int = 50

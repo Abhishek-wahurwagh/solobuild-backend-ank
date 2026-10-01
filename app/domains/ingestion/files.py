@@ -7,7 +7,7 @@ from pathlib import Path
 
 logger = logging.getLogger("ingestion.files")
 
-PROCESSABLE_EXTENSIONS = {".pdf", ".docx", ".txt"}
+PROCESSABLE_EXTENSIONS = {".pdf", ".docx", ".txt", ".csv"}
 JUNK_NAMES = {"__MACOSX", ".DS_Store", "Thumbs.db", "desktop.ini"}
 
 

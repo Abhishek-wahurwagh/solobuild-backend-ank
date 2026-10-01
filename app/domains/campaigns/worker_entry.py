@@ -25,6 +25,7 @@ from app.domains.campaigns.worker import (
     dispatch_campaign_calling,
     # ── Atomic workers ─────────────────────────────────────────────────────
     ingest_single_file,
+    process_csv_chunk,
     screen_single_candidate,
     call_single_candidate,
     # ── Maintenance ────────────────────────────────────────────────────────
@@ -52,6 +53,7 @@ class WorkerSettings:
         dispatch_campaign_calling,
         # Atomic workers — each processes exactly 1 item
         ingest_single_file,
+        process_csv_chunk,
         screen_single_candidate,
         call_single_candidate,
     ]
