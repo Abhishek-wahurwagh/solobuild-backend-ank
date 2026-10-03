@@ -102,6 +102,8 @@ class AgentPreset(Base):
         default=uuid7,
     )
 
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+
     conversation_style: Mapped[ConversationStyle] = mapped_column(
         SAEnum(
             ConversationStyle,

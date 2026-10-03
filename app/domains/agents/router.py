@@ -6,12 +6,41 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.domains.auth.dependencies import get_current_user
-from app.domains.agents.models import Agent
+from app.domains.agents.models import Agent, AgentPreset
 from app.domains.users.models import User
-from app.domains.agents.schemas import AgentCreate, AgentResponse, AgentUpdate
+from app.domains.agents.schemas import AgentCreate, AgentListItem, AgentResponse, AgentUpdate
 from app.domains.agents.service import AgentService
 
 router = APIRouter(prefix="/agents")
+
+
+@router.get(
+    "",
+    response_model=list[AgentListItem],
+    status_code=status.HTTP_200_OK,
+)
+async def list_agents_endpoint(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    user_agents_result = await db.execute(
+        select(Agent)
+        .where(Agent.created_by_user_id == current_user.id)
+        .order_by(Agent.created_at.desc())
+    )
+    presets_result = await db.execute(
+        select(AgentPreset).order_by(AgentPreset.created_at.desc())
+    )
+
+    user_agents = [
+        AgentListItem.model_validate(agent).model_copy(update={"is_preset": False})
+        for agent in user_agents_result.scalars()
+    ]
+    presets = [
+        AgentListItem.model_validate(preset).model_copy(update={"is_preset": True})
+        for preset in presets_result.scalars()
+    ]
+    return [*user_agents, *presets]
 
 
 @router.post(

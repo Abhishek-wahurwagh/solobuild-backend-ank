@@ -31,6 +31,10 @@ class AgentResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True, use_enum_values=True)
 
 
+class AgentListItem(AgentResponse):
+    is_preset: bool = False
+
+
 class AgentUpdate(BaseModel):
     name: str | None = None
     conversation_style: ConversationStyle | None = None
