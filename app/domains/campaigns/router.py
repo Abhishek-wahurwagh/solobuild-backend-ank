@@ -1,3 +1,4 @@
+from typing import Any
 from uuid import UUID
 
 from fastapi import (
@@ -10,6 +11,7 @@ from fastapi import (
     status,
     Body,
 )
+from pydantic import Json
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from uuid6 import uuid7
@@ -68,6 +70,7 @@ router = APIRouter(prefix="/campaigns")
 async def create_campaign(
     title: str = Form(...),
     raw_text: str | None = Form(None),
+    required_fields: Json[dict[str, Any]] | None = Form(None),
     file: UploadFile | None = File(None),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -79,11 +82,11 @@ async def create_campaign(
             detail="Provide either raw_text or a requirement file.",
         )
 
-    required_fields = await extract_document_fields_llm(resulting_raw_text)
+    extracted_fields = await extract_document_fields_llm(resulting_raw_text)
     campaign = Campaign(
         title=title,
         raw_text=resulting_raw_text,
-        required_fields=required_fields,
+        required_fields={**extracted_fields, **(required_fields or {})},
         created_by_user_id=current_user.id,
     )
     db.add(campaign)
@@ -97,6 +100,7 @@ async def update_campaign(
     campaign_id: UUID,
     title: str = Form(...),
     raw_text: str | None = Form(None),
+    required_fields: Json[dict[str, Any]] | None = Form(None),
     file: UploadFile | None = File(None),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -114,9 +118,15 @@ async def update_campaign(
 
     if raw_text is not None or file is not None:
         campaign.raw_text = await build_campaign_raw_text(raw_text, file)
-        campaign.required_fields = await extract_campaign_requirements_llm(
+        extracted_fields = await extract_campaign_requirements_llm(
             campaign.raw_text,
         )
+        campaign.required_fields = {**extracted_fields, **(required_fields or {})}
+    elif required_fields is not None:
+        campaign.required_fields = {
+            **(campaign.required_fields or {}),
+            **required_fields,
+        }
 
     if title:
         campaign.title = title
