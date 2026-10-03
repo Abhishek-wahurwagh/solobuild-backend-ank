@@ -515,7 +515,7 @@ async def call_candidates(
         Candidate.campaign_id == campaign_id,
         Candidate.phone.isnot(None),
     )
-    if request.candidate_ids:
+    if request.candidate_ids is not None:
         candidate_query = candidate_query.where(Candidate.id.in_(request.candidate_ids))
 
     candidate_results = await db.execute(candidate_query)
@@ -529,7 +529,11 @@ async def call_candidates(
     redis = await get_redis_client()
     try:
         await create_batch_tracker(redis, batch_id, file_count=len(candidates))
-        candidate_ids_str = [str(c.id) for c in candidates] if candidates else None
+        candidate_ids_str = (
+            [str(c.id) for c in candidates]
+            if request.candidate_ids is not None
+            else None
+        )
 
         await enqueue_campaign_calling(
             redis,

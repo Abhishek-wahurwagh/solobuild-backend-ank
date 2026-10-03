@@ -28,8 +28,8 @@ def build_vobiz_recording_url() -> str:
     return _public_url(settings.VOBIZ_RECORDING_PATH)
 
 
-def build_vobiz_media_url(session_id: str) -> str:
-    return _public_url(f"{settings.VOBIZ_MEDIA_PATH}/{session_id}", websocket=True)
+def build_vobiz_media_url(call_id: str) -> str:
+    return _public_url(f"{settings.VOBIZ_MEDIA_PATH}/{call_id}", websocket=True)
 
 
 def build_system_prompt(required_fields: dict[str, Any] | None = None, raw_text: str | None = None) -> str:
@@ -140,7 +140,7 @@ async def initiate_outbound_call(request: CallInitiationRequest) -> CallInitiati
 
 
 async def handle_call_completion(webhook: CallCompletionWebhook) -> dict[str, Any]:
-    """Normalize provider webhook payloads and optionally trigger campaign follow-up logic."""
+    """Persist callback state and enqueue durable post-call processing."""
     result = {
         "call_id": webhook.call_id,
         "candidate_id": str(webhook.candidate_id),
@@ -158,20 +158,17 @@ async def handle_call_completion(webhook: CallCompletionWebhook) -> dict[str, An
         recording_url=webhook.recording_url,
     )
 
-    from app.domains.campaigns.service import process_call_webhook
-    from app.domains.campaigns.schemas import CallWebhookPayload
-    import asyncio
-    asyncio.create_task(
-        process_call_webhook(
-            CallWebhookPayload(
-                call_id=webhook.call_id,
-                candidate_id=webhook.candidate_id,
-                campaign_id=webhook.campaign_id,
-                status=webhook.status,
-                transcript=webhook.transcript,
-                recording_url=webhook.recording_url,
-            )
+    from arq import create_pool
+    from arq.connections import RedisSettings
+
+    pool = await create_pool(RedisSettings.from_dsn(settings.REDIS_URL))
+    try:
+        await pool.enqueue_job(
+            "process_call_completion_job",
+            payload=result,
+            _job_id=f"call-completion:{webhook.call_id}",
         )
-    )
+    finally:
+        await pool.aclose()
 
     return result

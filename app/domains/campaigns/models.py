@@ -2,7 +2,7 @@ import enum
 import uuid
 from datetime import datetime
 from uuid6 import uuid7
-from sqlalchemy import String, Integer, Float, Text, Enum, ForeignKey, DateTime, func
+from sqlalchemy import String, Integer, Float, Text, Enum, ForeignKey, DateTime, Index, func
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 
@@ -88,8 +88,10 @@ class DocumentScreening(Base):
 
 class CallScreening(Base):
     __tablename__ = "call_screenings"
+    __table_args__ = (Index("uq_call_screenings_call_id", "call_id", unique=True),)
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid7)
+    call_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     campaign_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("campaigns.id"), nullable=False, index=True)
     candidate_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("candidates.id"), nullable=False, index=True)
 

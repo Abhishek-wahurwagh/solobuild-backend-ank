@@ -65,6 +65,7 @@ from app.domains.campaigns.service import (
     fail_batch,
     persist_candidate_from_ingestion,
     persist_csv_candidate,
+    process_call_webhook,
     screen_document_llm,
     update_batch_progress,
 )
@@ -73,6 +74,7 @@ from app.domains.ingestion.models import IngestionBatch, IngestionItem, Ingestio
 from app.domains.ingestion.pipeline import run_csv_pipeline, run_document_pipeline
 from app.domains.ingestion.text import csv_rows_to_text, extract_csv_rows
 from app.domains.telephony.schemas import CallInitiationRequest
+from app.domains.campaigns.schemas import CallWebhookPayload
 from app.domains.telephony.service import initiate_outbound_call
 
 logger = logging.getLogger("arq.worker.document")
@@ -226,6 +228,10 @@ async def dispatch_campaign_calling(
     redis = await get_redis_client()
     try:
         await update_batch_progress(redis, batch_id, status="PROCESSING")
+
+        if candidate_ids == []:
+            await complete_batch(redis, batch_id)
+            return {"batch_id": batch_id, "status": "COMPLETED", "task_count": 0}
 
         async with AsyncSessionLocal() as db:
             query = select(Candidate).where(
@@ -730,6 +736,17 @@ async def call_single_candidate(
 
     finally:
         await redis.aclose()
+
+
+async def process_call_completion_job(
+    ctx: dict[str, Any],
+    *,
+    payload: dict[str, Any],
+) -> dict[str, str]:
+    """Run post-call extraction and screening as a retryable ARQ job."""
+    webhook = CallWebhookPayload.model_validate(payload)
+    await process_call_webhook(webhook)
+    return {"call_id": webhook.call_id, "status": "COMPLETED"}
 
 
 # ===========================================================================

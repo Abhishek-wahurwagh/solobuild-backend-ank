@@ -28,6 +28,7 @@ from app.domains.campaigns.worker import (
     process_csv_chunk,
     screen_single_candidate,
     call_single_candidate,
+    process_call_completion_job,
     # ── Maintenance ────────────────────────────────────────────────────────
     reconcile_zombie_tasks,
 )
@@ -56,6 +57,7 @@ class WorkerSettings:
         process_csv_chunk,
         screen_single_candidate,
         call_single_candidate,
+        process_call_completion_job,
     ]
 
     cron_jobs = [
