@@ -10,28 +10,6 @@ from app.domains.telephony.schemas import CallCompletionWebhook, CallInitiationR
 from app.integrations.telephony.factory import TelephonyCarrierFactory
 
 
-def _public_url(path: str, *, websocket: bool = False) -> str:
-    base_url = settings.APP_BASE_URL.rstrip("/")
-    if websocket:
-        base_url = base_url.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
-    return f"{base_url}{path}"
-
-
-def build_vobiz_answer_url(candidate_id: str, campaign_id: str) -> str:
-    return (
-        f"{_public_url(settings.VOBIZ_ANSWER_PATH)}"
-        f"?candidate_id={candidate_id}&campaign_id={campaign_id}"
-    )
-
-
-def build_vobiz_recording_url() -> str:
-    return _public_url(settings.VOBIZ_RECORDING_PATH)
-
-
-def build_vobiz_media_url(call_id: str) -> str:
-    return _public_url(f"{settings.VOBIZ_MEDIA_PATH}/{call_id}", websocket=True)
-
-
 def build_system_prompt(required_fields: dict[str, Any] | None = None, raw_text: str | None = None) -> str:
     requirements = required_fields or {}
     fields_summary = "\n".join(f"- {key}: {value}" for key, value in requirements.items()) if requirements else "- No explicit requirements provided."
@@ -121,7 +99,10 @@ async def initiate_outbound_call(request: CallInitiationRequest) -> CallInitiati
         candidate_phone=request.candidate_phone,
         candidate_id=request.candidate_id,
         campaign_id=request.campaign_id,
-        answer_url=build_vobiz_answer_url(str(request.candidate_id), str(request.campaign_id)),
+        answer_url=carrier.build_answer_url(
+            candidate_id=request.candidate_id,
+            campaign_id=request.campaign_id,
+        ),
     )
 
     await set_call_status(

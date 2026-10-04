@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from uuid import UUID
+from urllib.parse import urlencode
 
 import httpx
 
@@ -13,6 +14,14 @@ logger = logging.getLogger("solo.telephony.vobiz")
 
 class VobizTelephonyCarrier(BaseTelephonyCarrier):
     """Vobiz REST call-control adapter."""
+
+    def build_answer_url(self, *, candidate_id: UUID, campaign_id: UUID) -> str:
+        base_url = settings.APP_BASE_URL.rstrip("/")
+        answer_path = settings.VOBIZ_ANSWER_PATH
+        return (
+            f"{base_url}{answer_path}?"
+            f"{urlencode({'candidate_id': str(candidate_id), 'campaign_id': str(campaign_id)})}"
+        )
 
     async def initiate_call(
         self,

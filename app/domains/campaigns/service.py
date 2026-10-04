@@ -861,6 +861,12 @@ async def process_call_webhook(payload: CallWebhookPayload) -> None:
             if not candidate:
                 raise ValueError("Candidate not found")
 
+            if payload.status.strip().casefold() == "failed":
+                if candidate.step_status == WorkflowStepStatus.IN_PROGRESS:
+                    candidate.step_status = WorkflowStepStatus.FAILED
+                    await db.commit()
+                return
+
             campaign_result = await db.execute(
                 select(Campaign).where(Campaign.id == payload.campaign_id)
             )

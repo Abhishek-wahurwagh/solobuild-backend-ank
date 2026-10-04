@@ -49,13 +49,11 @@ class Settings(BaseSettings):
     TELEPHONY_WEBHOOK_SECRET: str = ""
     TELEPHONY_WEBHOOK_HEADER: str = "X-Telephony-Signature"
     VOBIZ_WEBHOOK_SECRET: str = ""
-    PIPECAT_LLM_PROVIDER: str = "gemini"
-    PIPECAT_LLM_MODEL: str = ""
-    PIPECAT_STT_PROVIDER: str = "gemini"
-    PIPECAT_TTS_PROVIDER: str = "gemini"
-    PIPECAT_STT_MODEL: str = "gpt-4o-mini-transcribe"
-    PIPECAT_TTS_MODEL: str = "gpt-4o-mini-tts"
-    PIPECAT_TTS_VOICE: str = "alloy"
+    PIPECAT_VOICE_PROVIDER: str = "gemini_live"
+    PIPECAT_GEMINI_API_KEY: str = ""
+    PIPECAT_GEMINI_LIVE_MODEL: str = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+    PIPECAT_GEMINI_LIVE_VOICE: str = "Charon"
+    PIPECAT_GEMINI_LIVE_LANGUAGE: str = "en-US"
 
     # Resume & CSV pipeline
     CSV_CHUNK_SIZE: int = 50
