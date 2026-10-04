@@ -54,10 +54,10 @@ def _get_webhook_secret() -> str:
 
 
 def verify_webhook_signature(payload: bytes, signature: str | None) -> bool:
-    """Validate the webhook signature when a shared secret is configured."""
+    """Fail closed when a shared secret is not configured."""
     secret = _get_webhook_secret()
     if not secret:
-        return True
+        return False
     if not signature:
         return False
 
