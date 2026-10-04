@@ -8,6 +8,13 @@ Start with::
 Or during development::
 
     python -m arq app.domains.campaigns.worker_entry.WorkerSettings
+
+Terminal failure handling
+The ``ingest_single_file`` and ``call_single_candidate`` atomic workers detect
+terminal failure inline by comparing ``ctx['job_try']`` against
+``settings.WORKER_MAX_TRIES``.  On the last attempt the item/candidate is
+removed from the Redis pending Set so the batch can reach completion even when
+individual files fail permanently.  No separate ``on_job_end`` hook is needed.
 """
 
 from __future__ import annotations

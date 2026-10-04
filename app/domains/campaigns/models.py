@@ -2,7 +2,18 @@ import enum
 import uuid
 from datetime import datetime
 from uuid6 import uuid7
-from sqlalchemy import String, Integer, Float, Text, Enum, ForeignKey, DateTime, Index, func
+from sqlalchemy import (
+    String,
+    Integer,
+    Float,
+    Text,
+    Enum,
+    ForeignKey,
+    DateTime,
+    Index,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 
@@ -50,6 +61,9 @@ class Campaign(Base):
 
 class Candidate(Base):
     __tablename__ = "candidates"
+    __table_args__ = (
+        UniqueConstraint("source_row_key", name="uq_candidates_source_row_key"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid7)
     campaign_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("campaigns.id"), nullable=False, index=True)
@@ -61,6 +75,7 @@ class Candidate(Base):
     ingestion_item_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("ingestion_items.id"), nullable=True, unique=True
     )
+    source_row_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
     extracted_fields: Mapped[dict] = mapped_column(JSONB, nullable=True, default=dict)
     
     workflow_step: Mapped[str] = mapped_column(String(255), nullable=True)

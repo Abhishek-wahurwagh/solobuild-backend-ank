@@ -103,9 +103,11 @@ class CampaignFieldsUpdate(BaseModel):
 class BatchStatusResponse(BaseModel):
     batch_id: str
     status: str
-    total_candidates: int
-    processed: int
-    failed: int
+    total_candidates: int = Field(
+        description="Total work units; large CSV ingestion counts one unit per chunk."
+    )
+    processed: int = Field(description="Number of completed work units.")
+    failed: int = Field(description="Number of failed work units.")
     created_at: str | None = None
     updated_at: str | None = None
     finished_at: str | None = None

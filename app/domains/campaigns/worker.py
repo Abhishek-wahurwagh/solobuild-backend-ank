@@ -57,8 +57,10 @@ from app.domains.campaigns.models import (
 )
 from app.domains.campaigns.orchestrator import on_step_completed
 from app.domains.campaigns.service import (
+    adjust_batch_total_once,
     batch_add_pending,
     batch_mark_done,
+    batch_mark_done_with_progress,
     complete_batch,
     extract_candidates_from_csv_llm,
     extract_document_fields_llm,
@@ -69,9 +71,15 @@ from app.domains.campaigns.service import (
     screen_document_llm,
     update_batch_progress,
 )
+from app.domains.ingestion.files import safe_extract_zip
 from app.domains.ingestion.files import collect_processable_files
-from app.domains.ingestion.models import IngestionBatch, IngestionItem, IngestionItemStatus
-from app.domains.ingestion.pipeline import run_csv_pipeline, run_document_pipeline
+from app.domains.ingestion.models import (
+    IngestionBatch,
+    IngestionChunk,
+    IngestionItem,
+    IngestionItemStatus,
+)
+from app.domains.ingestion.pipeline import run_document_pipeline
 from app.domains.ingestion.text import csv_rows_to_text, extract_csv_rows
 from app.domains.telephony.schemas import CallInitiationRequest
 from app.domains.campaigns.schemas import CallWebhookPayload
@@ -156,7 +164,12 @@ async def dispatch_ingestion_batch(
         finally:
             await pool.aclose()
 
-        logger.info("dispatch_ingestion_batch %s: dispatched %d tasks.", batch_id, len(items))
+        logger.info(
+            "dispatch_ingestion_batch %s: dispatched %d tasks (source_type=%s).",
+            batch_id,
+            len(items),
+            source_type,
+        )
         return {"batch_id": batch_id, "status": "DISPATCHED", "task_count": len(items)}
 
     except Exception as exc:
@@ -290,17 +303,29 @@ async def ingest_single_file(
 ) -> dict[str, Any]:
     """Download and pipeline exactly one document file.
 
-    Removes the item from the Redis pending Set on definitive success.
-    On terminal failure (after max_tries) the Set entry is also removed so
-    the batch can still reach completion.  A private on_job_end hook in
-    worker_entry.py handles the terminal-failure removal.
+    Removes the item from the Redis pending Set on definitive success or
+    terminal failure.  Terminal failure is detected inline by comparing
+    ``ctx['job_try']`` against ``settings.WORKER_MAX_TRIES``; when the last
+    attempt is exhausted we mark the item FAILED and remove it from the Set so
+    the batch can still reach completion rather than hanging forever.
+
+    Supports PDF, DOCX, TXT, CSV, and ZIP files.  ZIPs are extracted in-place:
+    each member file gets its own IngestionItem row and is fanned out as a
+    separate ``ingest_single_file`` task, mirroring the multi-chunk CSV pattern.
     """
     redis = await get_redis_client()
     tmp_dir: Path | None = None
 
     try:
         tmp_dir = Path(tempfile.mkdtemp(prefix=f"ingest_{ingestion_item_id}_"))
-        tmp_file = tmp_dir / display_name
+        safe_display_name = Path(display_name.replace("\\", "/")).name
+        if (
+            not safe_display_name
+            or safe_display_name in {".", ".."}
+            or ":" in safe_display_name
+        ):
+            raise ValueError("Ingestion item has an invalid display name.")
+        tmp_file = tmp_dir / safe_display_name
 
         await asyncio.to_thread(download_s3_object, source_key, tmp_file)
 
@@ -309,8 +334,12 @@ async def ingest_single_file(
             if item is None:
                 raise RuntimeError(f"IngestionItem {ingestion_item_id} not found.")
             if item.status == IngestionItemStatus.COMPLETED:
-                # Idempotent  already done (e.g. duplicate delivery)
-                is_last = await batch_mark_done(redis, batch_id, ingestion_item_id)
+                # Idempotent — already done (e.g. duplicate delivery)
+                is_last = await batch_mark_done_with_progress(
+                    redis,
+                    batch_id,
+                    ingestion_item_id,
+                )
                 if is_last:
                     await _finalise_ingestion_batch(redis, batch_id)
                 return {"ingestion_item_id": ingestion_item_id, "status": "ALREADY_DONE"}
@@ -325,42 +354,230 @@ async def ingest_single_file(
                 raise RuntimeError(f"IngestionItem {ingestion_item_id} vanished.")
 
             ext = tmp_file.suffix.lower()
-            if ext == ".csv":
+
+            # ----------------------------------------------------------------
+            # ZIP: extract members, create per-file IngestionItems, fan out
+            # ----------------------------------------------------------------
+            if ext == ".zip":
+                extracted_files = await asyncio.to_thread(
+                    safe_extract_zip, tmp_file, tmp_dir
+                )
+
+                if not extracted_files:
+                    raise RuntimeError(
+                        f"ZIP {display_name} contained no processable files after extraction."
+                    )
+
+                # Build IngestionItem rows for each extracted member file.
+                # member_path stores the relative path inside the ZIP so the
+                # unique constraint (batch_id, source_key, member_path) allows
+                # multiple members from the same ZIP source_key.
+                ingestion_batch_id = UUID(batch_id.removeprefix("batch_"))
+                member_items: list[IngestionItem] = []
+                for member_path in extracted_files:
+                    # Relative path inside __expanded__ dir
+                    rel = member_path.relative_to(tmp_dir / "__expanded__")
+                    member_s3_key = f"{s3_prefix}/zip_members/{ingestion_item_id}/{rel.as_posix()}"
+
+                    # Upload the extracted file to S3 so downstream workers can download it
+                    file_bytes = member_path.read_bytes()
+                    await asyncio.to_thread(
+                        upload_bytes_to_s3,
+                        member_s3_key,
+                        file_bytes,
+                    )
+
+                    member_result = await db.execute(
+                        select(IngestionItem).where(
+                            IngestionItem.batch_id == ingestion_batch_id,
+                            IngestionItem.source_key == member_s3_key,
+                            IngestionItem.member_path == rel.as_posix(),
+                        )
+                    )
+                    member_item = member_result.scalar_one_or_none()
+                    if member_item is None:
+                        member_item = IngestionItem(
+                            batch_id=ingestion_batch_id,
+                            source_key=member_s3_key,
+                            display_name=member_path.name,
+                            member_path=rel.as_posix(),
+                        )
+                        db.add(member_item)
+                    elif member_item.status != IngestionItemStatus.COMPLETED:
+                        member_item.status = IngestionItemStatus.PENDING
+                        member_item.last_error = None
+                    member_items.append(member_item)
+
+                await db.flush()
+                await db.commit()
+
+                pending_member_items = [
+                    member_item
+                    for member_item in member_items
+                    if member_item.status != IngestionItemStatus.COMPLETED
+                ]
+
+                # Register member task IDs into the Redis pending Set before
+                # fanning out so cardinality is correct when first member completes
+                await batch_add_pending(
+                    redis,
+                    batch_id,
+                    [str(member_item.id) for member_item in pending_member_items],
+                )
+                # Replace the ZIP work unit with one unit for each extracted member.
+                await adjust_batch_total_once(
+                    redis,
+                    batch_id,
+                    f"zip:{ingestion_item_id}",
+                    len(pending_member_items) - 1,
+                )
+
+                pool = await _get_arq_pool()
+                try:
+                    for member_item in pending_member_items:
+                        await pool.enqueue_job(
+                            "ingest_single_file",
+                            batch_id=batch_id,
+                            campaign_id=campaign_id,
+                            ingestion_item_id=str(member_item.id),
+                            s3_prefix=s3_prefix,
+                            source_key=member_item.source_key,
+                            display_name=member_item.display_name,
+                        )
+                finally:
+                    await pool.aclose()
+
+                item.status = IngestionItemStatus.COMPLETED
+                item.current_stage = None
+                item.last_error = None
+                await db.commit()
+
+                # ZIP parent is now a "processed" unit — use batch_mark_done_with_progress
+                # so the processed counter stays consistent with the UI display.
+                is_last = await batch_mark_done_with_progress(redis, batch_id, ingestion_item_id)
+                if is_last:
+                    await _finalise_ingestion_batch(redis, batch_id)
+
+                logger.info(
+                    "ingest_single_file: ZIP %s extracted %d member files, fanned out tasks.",
+                    display_name,
+                    len(member_items),
+                )
+                return {
+                    "ingestion_item_id": ingestion_item_id,
+                    "status": "FANNED_OUT",
+                    "member_count": len(member_items),
+                }
+
+            # ----------------------------------------------------------------
+            # CSV: all files use durable chunk jobs, including a one-chunk file.
+            # ----------------------------------------------------------------
+            elif ext == ".csv":
                 csv_bytes = tmp_file.read_bytes()
                 headers, rows = extract_csv_rows(csv_bytes)
+                if not rows:
+                    raise RuntimeError("CSV contains no data rows.")
                 chunk_size = getattr(settings, "CSV_CHUNK_SIZE", 50)
 
-                if len(rows) > chunk_size:
-                    # Multi-chunk CSV: fan out atomic tasks into ARQ
-                    chunk_slices = [
-                        rows[i : i + chunk_size]
-                        for i in range(0, len(rows), chunk_size)
+                if rows:
+                    chunk_result = await db.execute(
+                        select(IngestionChunk).where(
+                            IngestionChunk.ingestion_item_id == UUID(ingestion_item_id)
+                        )
+                    )
+                    existing_chunks = sorted(
+                        chunk_result.scalars().all(),
+                        key=lambda chunk: chunk.chunk_index,
+                    )
+                    if not existing_chunks:
+                        chunk_slices = [
+                            (start, rows[start : start + chunk_size])
+                            for start in range(0, len(rows), chunk_size)
+                        ]
+                        existing_chunks = [
+                            IngestionChunk(
+                                ingestion_item_id=UUID(ingestion_item_id),
+                                chunk_index=index,
+                                row_start=start,
+                                row_count=len(chunk_rows),
+                                status="PENDING",
+                            )
+                            for index, (start, chunk_rows) in enumerate(chunk_slices)
+                        ]
+                        db.add_all(existing_chunks)
+                    else:
+                        expected_start = 0
+                        for index, chunk in enumerate(existing_chunks):
+                            if (
+                                chunk.chunk_index != index
+                                or chunk.row_start != expected_start
+                                or chunk.row_count <= 0
+                            ):
+                                raise RuntimeError(
+                                    "Stored CSV chunk layout is invalid; refusing to "
+                                    "reprocess with a different row partition."
+                                )
+                            expected_start += chunk.row_count
+                        if expected_start != len(rows):
+                            raise RuntimeError(
+                                "CSV content changed after chunking; refusing to "
+                                "reuse stale chunk results."
+                            )
+                    num_chunks = len(existing_chunks)
+                    for chunk in existing_chunks:
+                        if chunk.status == "FAILED":
+                            chunk.status = "PENDING"
+                            chunk.last_error = None
+                    item.status = IngestionItemStatus.PROCESSING
+                    await db.commit()
+                    pending_chunks = [
+                        chunk
+                        for chunk in existing_chunks
+                        if chunk.status != "COMPLETED"
                     ]
-                    num_chunks = len(chunk_slices)
+                    pending_chunk_slices = [
+                        (
+                            chunk,
+                            chunk.row_start,
+                            rows[chunk.row_start : chunk.row_start + chunk.row_count],
+                        )
+                        for chunk in pending_chunks
+                    ]
                     chunk_task_ids = [
-                        f"csv_chunk_{ingestion_item_id}_{idx}"
-                        for idx in range(num_chunks)
+                        f"csv_chunk_{ingestion_item_id}_{chunk.chunk_index}"
+                        for chunk in pending_chunks
                     ]
 
                     # Register all chunk tasks into Redis pending Set
                     await batch_add_pending(redis, batch_id, chunk_task_ids)
-                    # Expand the total candidates count by (num_chunks - 1)
-                    await update_batch_progress(redis, batch_id, total_candidates=None)
+                    # Replace this CSV file work unit (counted as 1 by the dispatcher)
+                    # with one unit per actual candidate row so the UI shows a meaningful
+                    # total.  adjust_batch_total_once is idempotent — safe across retries.
+                    await adjust_batch_total_once(
+                        redis,
+                        batch_id,
+                        f"csv:{ingestion_item_id}",
+                        len(rows) - 1,
+                    )
 
                     pool = await _get_arq_pool()
                     try:
-                        for idx, chunk_rows in enumerate(chunk_slices):
+                        for chunk, chunk_start, chunk_rows in pending_chunk_slices:
                             chunk_text = csv_rows_to_text(headers, chunk_rows)
                             await pool.enqueue_job(
                                 "process_csv_chunk",
                                 batch_id=batch_id,
                                 campaign_id=campaign_id,
                                 ingestion_item_id=ingestion_item_id,
-                                chunk_task_id=chunk_task_ids[idx],
+                                chunk_task_id=(
+                                    f"csv_chunk_{ingestion_item_id}_{chunk.chunk_index}"
+                                ),
                                 source_key=source_key,
                                 display_name=display_name,
                                 chunk_text=chunk_text,
-                                is_last_chunk=(idx == num_chunks - 1),
+                                chunk_index=chunk.chunk_index,
+                                row_start=chunk_start,
+                                row_count=len(chunk_rows),
                             )
                     finally:
                         await pool.aclose()
@@ -383,32 +600,9 @@ async def ingest_single_file(
                         "total_rows": len(rows),
                     }
 
-                # Single chunk (<= chunk_size): process inline
-                async def process_csv_candidate_cb(
-                    cand_fields: dict[str, Any],
-                    _db: AsyncSession = db,
-                ) -> None:
-                    candidate = await persist_csv_candidate(
-                        _db,
-                        campaign_id=UUID(campaign_id),
-                        ingestion_item_id=UUID(ingestion_item_id),
-                        source_url=f"s3://{settings.AWS_BUCKET_NAME}/{source_key}",
-                        extracted_fields=cand_fields,
-                    )
-                    await on_step_completed(
-                        _db,
-                        candidate.id,
-                        "document_extraction",
-                        payload={"file": display_name, "extracted_fields": cand_fields},
-                    )
-
-                count = await run_csv_pipeline(
-                    csv_bytes,
-                    extract_candidates=extract_candidates_from_csv_llm,
-                    process_candidate=process_csv_candidate_cb,
-                    chunk_size=chunk_size,
-                )
-                logger.info("ingest_single_file: processed %d candidates from CSV %s inline", count, display_name)
+            # ----------------------------------------------------------------
+            # PDF / DOCX / TXT: single document → single candidate
+            # ----------------------------------------------------------------
             else:
                 async def process_fields(
                     extracted_fields: dict[str, Any],
@@ -436,14 +630,17 @@ async def ingest_single_file(
                     extract_fields=extract_document_fields_llm,
                     process_fields=process_fields,
                 )
+
             item.status = IngestionItemStatus.COMPLETED
             item.current_stage = None
             item.last_error = None
             await db.commit()
 
-        await update_batch_progress(redis, batch_id, processed_incr=1)
-
-        is_last = await batch_mark_done(redis, batch_id, ingestion_item_id)
+        is_last = await batch_mark_done_with_progress(
+            redis,
+            batch_id,
+            ingestion_item_id,
+        )
         if is_last:
             await _finalise_ingestion_batch(redis, batch_id)
 
@@ -452,14 +649,71 @@ async def ingest_single_file(
 
     except Exception as exc:
         logger.exception("ingest_single_file: item %s failed.", ingestion_item_id)
-        async with AsyncSessionLocal() as db:
-            item = await db.get(IngestionItem, UUID(ingestion_item_id))
-            if item:
-                item.status = IngestionItemStatus.RETRYABLE
-                item.last_error = str(exc)[:1000]
-                await db.commit()
-        await update_batch_progress(redis, batch_id, failed_incr=1)
-        raise  # ARQ will retry up to max_tries; worker_entry on_job_end handles terminal removal
+
+        # Determine whether this is the terminal (last) attempt.
+        # ctx['job_try'] is the 1-based attempt number provided by ARQ.
+        job_try: int = ctx.get("job_try", 1)
+        is_terminal = job_try >= settings.WORKER_MAX_TRIES
+
+        already_completed = False
+        try:
+            async with AsyncSessionLocal() as db:
+                item = await db.get(IngestionItem, UUID(ingestion_item_id))
+                already_completed = bool(
+                    item and item.status == IngestionItemStatus.COMPLETED
+                )
+                if item and not already_completed:
+                    if is_terminal:
+                        item.status = IngestionItemStatus.FAILED
+                    else:
+                        item.status = IngestionItemStatus.RETRYABLE
+                    item.last_error = str(exc)[:1000]
+                    await db.commit()
+        except Exception:
+            # DB unavailable during error handling — log and continue so the
+            # Redis pending Set is still cleaned up on terminal failures.
+            logger.exception(
+                "ingest_single_file: failed to update DB status for item %s", ingestion_item_id
+            )
+
+        if already_completed:
+            if Path(display_name.replace("\\", "/")).suffix.lower() == ".zip":
+                is_last = await batch_mark_done(redis, batch_id, ingestion_item_id)
+            else:
+                is_last = await batch_mark_done_with_progress(
+                    redis,
+                    batch_id,
+                    ingestion_item_id,
+                )
+            if is_last:
+                await _finalise_ingestion_batch(redis, batch_id)
+            return {
+                "ingestion_item_id": ingestion_item_id,
+                "status": "ALREADY_DONE",
+            }
+
+        if is_terminal:
+            # Remove this item from the pending Set so the batch can still
+            # complete rather than hanging forever waiting for a job that
+            # will never succeed.
+            logger.warning(
+                "ingest_single_file: item %s reached terminal failure (try %d/%d), "
+                "removing from pending Set.",
+                ingestion_item_id,
+                job_try,
+                settings.WORKER_MAX_TRIES,
+            )
+            is_last = await batch_mark_done_with_progress(
+                redis,
+                batch_id,
+                ingestion_item_id,
+                failed=True,
+            )
+            if is_last:
+                await _finalise_ingestion_batch(redis, batch_id)
+        else:
+            # Not terminal yet — let ARQ retry; do NOT remove from Set
+            raise
 
     finally:
         if tmp_dir and tmp_dir.exists():
@@ -477,7 +731,9 @@ async def process_csv_chunk(
     source_key: str,
     display_name: str,
     chunk_text: str,
-    is_last_chunk: bool = False,
+    chunk_index: int,
+    row_start: int,
+    row_count: int,
 ) -> dict[str, Any]:
     """Atomic worker: extracts and persists candidates for one CSV chunk.
 
@@ -486,39 +742,97 @@ async def process_csv_chunk(
     """
     redis = await get_redis_client()
     try:
-        # Extract candidates from this chunk using LLM
-        candidates_data = await extract_candidates_from_csv_llm(chunk_text)
+        async with AsyncSessionLocal() as db:
+            chunk_result = await db.execute(
+                select(IngestionChunk).where(
+                    IngestionChunk.ingestion_item_id == UUID(ingestion_item_id),
+                    IngestionChunk.chunk_index == chunk_index,
+                )
+            )
+            chunk = chunk_result.scalar_one_or_none()
+            if chunk is None:
+                raise RuntimeError(
+                    f"CSV chunk {chunk_index} for ingestion item "
+                    f"{ingestion_item_id} was not registered."
+                )
+            if chunk.status == "COMPLETED":
+                is_last = await batch_mark_done_with_progress(
+                    redis,
+                    batch_id,
+                    chunk_task_id,
+                )
+                if is_last:
+                    await _finalise_ingestion_batch(redis, batch_id)
+                return {"chunk_task_id": chunk_task_id, "status": "ALREADY_DONE"}
+
+        candidates_data = chunk.result
+        if candidates_data is None:
+            extracted = await extract_candidates_from_csv_llm(chunk_text)
+            if len(extracted) > row_count:
+                raise RuntimeError(
+                    f"CSV chunk {chunk_index} returned more candidates than input rows."
+                )
+            async with AsyncSessionLocal() as db:
+                chunk_result = await db.execute(
+                    select(IngestionChunk)
+                    .where(
+                        IngestionChunk.ingestion_item_id == UUID(ingestion_item_id),
+                        IngestionChunk.chunk_index == chunk_index,
+                    )
+                    .with_for_update()
+                )
+                chunk = chunk_result.scalar_one_or_none()
+                if chunk is None:
+                    raise RuntimeError(
+                        f"CSV chunk {chunk_index} for ingestion item "
+                        f"{ingestion_item_id} was not registered."
+                    )
+                if chunk.result is None:
+                    chunk.result = extracted
+                candidates_data = chunk.result
+                await db.commit()
 
         async with AsyncSessionLocal() as db:
-            for cand_fields in candidates_data:
-                candidate = await persist_csv_candidate(
-                    db,
-                    campaign_id=UUID(campaign_id),
-                    ingestion_item_id=UUID(ingestion_item_id),
-                    source_url=f"s3://{settings.AWS_BUCKET_NAME}/{source_key}",
-                    extracted_fields=cand_fields,
+            chunk_result = await db.execute(
+                select(IngestionChunk)
+                .where(
+                    IngestionChunk.ingestion_item_id == UUID(ingestion_item_id),
+                    IngestionChunk.chunk_index == chunk_index,
                 )
-                await on_step_completed(
-                    db,
-                    candidate.id,
-                    "document_extraction",
-                    payload={"file": display_name, "extracted_fields": cand_fields},
+                .with_for_update()
+            )
+            chunk = chunk_result.scalar_one_or_none()
+            if chunk is None:
+                raise RuntimeError(
+                    f"CSV chunk {chunk_index} for ingestion item "
+                    f"{ingestion_item_id} was not registered."
                 )
-            await db.commit()
+            if chunk.status != "COMPLETED":
+                for candidate_index, cand_fields in enumerate(candidates_data):
+                    candidate, created = await persist_csv_candidate(
+                        db,
+                        campaign_id=UUID(campaign_id),
+                        ingestion_item_id=UUID(ingestion_item_id),
+                        source_row_key=f"{ingestion_item_id}:{row_start + candidate_index}",
+                        source_url=f"s3://{settings.AWS_BUCKET_NAME}/{source_key}",
+                        extracted_fields=cand_fields,
+                    )
+                    if created:
+                        await on_step_completed(
+                            db,
+                            candidate.id,
+                            "document_extraction",
+                            payload={"file": display_name, "extracted_fields": cand_fields},
+                        )
+                chunk.status = "COMPLETED"
+                chunk.last_error = None
+                await db.commit()
 
-        # If this is the last chunk, mark the parent IngestionItem as completed
-        if is_last_chunk:
-            async with AsyncSessionLocal() as db:
-                item = await db.get(IngestionItem, UUID(ingestion_item_id))
-                if item:
-                    item.status = IngestionItemStatus.COMPLETED
-                    item.current_stage = None
-                    item.last_error = None
-                    await db.commit()
-
-        await update_batch_progress(redis, batch_id, processed_incr=1)
-
-        is_last = await batch_mark_done(redis, batch_id, chunk_task_id)
+        is_last = await batch_mark_done_with_progress(
+            redis,
+            batch_id,
+            chunk_task_id,
+        )
         if is_last:
             await _finalise_ingestion_batch(redis, batch_id)
 
@@ -535,8 +849,42 @@ async def process_csv_chunk(
 
     except Exception as exc:
         logger.exception("process_csv_chunk: %s failed.", chunk_task_id)
-        await update_batch_progress(redis, batch_id, failed_incr=1)
-        raise
+        job_try: int = ctx.get("job_try", 1)
+        is_terminal = job_try >= settings.WORKER_MAX_TRIES
+        chunk_completed = False
+        async with AsyncSessionLocal() as db:
+            chunk_result = await db.execute(
+                select(IngestionChunk).where(
+                    IngestionChunk.ingestion_item_id == UUID(ingestion_item_id),
+                    IngestionChunk.chunk_index == chunk_index,
+                )
+            )
+            chunk = chunk_result.scalar_one_or_none()
+            chunk_completed = bool(chunk and chunk.status == "COMPLETED")
+            if chunk and not chunk_completed:
+                chunk.status = "FAILED" if is_terminal else "RETRYABLE"
+                chunk.last_error = str(exc)[:1000]
+                await db.commit()
+
+        if chunk_completed:
+            is_last = await batch_mark_done_with_progress(
+                redis,
+                batch_id,
+                chunk_task_id,
+            )
+            if is_last:
+                await _finalise_ingestion_batch(redis, batch_id)
+        elif is_terminal:
+            is_last = await batch_mark_done_with_progress(
+                redis,
+                batch_id,
+                chunk_task_id,
+                failed=True,
+            )
+            if is_last:
+                await _finalise_ingestion_batch(redis, batch_id)
+        else:
+            raise
     finally:
         await redis.aclose()
 
@@ -577,12 +925,19 @@ async def screen_single_candidate(
                     await complete_batch(redis, batch_id, status="PARTIAL")
                 return {"candidate_id": candidate_id, "status": "SKIPPED"}
 
-            # Idempotency guard
-            if candidate.step_status == WorkflowStepStatus.COMPLETED:
+            # Extraction completion must not prevent the candidate's first screening.
+            if (
+                candidate.step_status == WorkflowStepStatus.COMPLETED
+                and candidate.workflow_step != "document_extraction"
+            ):
                 is_last = await batch_mark_done(redis, batch_id, candidate_id)
                 if is_last:
                     await complete_batch(redis, batch_id)
                 return {"candidate_id": candidate_id, "status": "ALREADY_DONE"}
+
+            candidate.workflow_step = "document_screening"
+            candidate.step_status = WorkflowStepStatus.IN_PROGRESS
+            await db.commit()
 
             screening_payload = await screen_document_llm(
                 candidate_fields=candidate.extracted_fields or {},
@@ -663,11 +1018,16 @@ async def call_single_candidate(
                     await complete_batch(redis, batch_id, status="PARTIAL")
                 return {"candidate_id": candidate_id, "status": "SKIPPED"}
 
-            #  Pause guard (pure DB state  no Redis flag) 
+            #  Pause guard (pure DB state — no Redis flag)
             if candidate.step_status == WorkflowStepStatus.PAUSED:
                 logger.info(
                     "call_single_candidate: candidate %s is PAUSED, exiting.", candidate_id
                 )
+                # Must still remove from pending Set so the batch can complete
+                # when all other candidates finish or are also paused.
+                is_last = await batch_mark_done(redis, batch_id, candidate_id)
+                if is_last:
+                    await complete_batch(redis, batch_id, status="PARTIAL")
                 return {"candidate_id": candidate_id, "status": "PAUSED"}
 
             # Idempotency guard
@@ -729,10 +1089,25 @@ async def call_single_candidate(
         logger.exception("call_single_candidate: candidate %s failed.", candidate_id)
         await redis.srem(active_calls_key, candidate_id)  # type: ignore
         await update_batch_progress(redis, batch_id, failed_incr=1)
+
+        # Reset candidate back to PENDING so ARQ retries can actually attempt
+        # the call again (idempotency guard would skip IN_PROGRESS candidates).
+        job_try: int = ctx.get("job_try", 1)
+        is_terminal = job_try >= settings.WORKER_MAX_TRIES
+        async with AsyncSessionLocal() as db:
+            candidate = await db.get(Candidate, UUID(candidate_id))
+            if candidate and candidate.step_status == WorkflowStepStatus.IN_PROGRESS:
+                candidate.step_status = (
+                    WorkflowStepStatus.FAILED if is_terminal else WorkflowStepStatus.PENDING
+                )
+                await db.commit()
+
         is_last = await batch_mark_done(redis, batch_id, candidate_id)
         if is_last:
             await complete_batch(redis, batch_id, status="PARTIAL")
-        raise
+
+        if not is_terminal:
+            raise
 
     finally:
         await redis.aclose()
@@ -828,6 +1203,43 @@ async def _finalise_ingestion_batch(redis: Any, batch_id: str) -> None:
     async with AsyncSessionLocal() as db:
         batch = await db.get(IngestionBatch, ingestion_batch_id)
         if batch:
+            item_result = await db.execute(
+                select(IngestionItem).where(
+                    IngestionItem.batch_id == ingestion_batch_id
+                )
+            )
+            items = item_result.scalars().all()
+            chunk_result = await db.execute(
+                select(IngestionChunk).where(
+                    IngestionChunk.ingestion_item_id.in_(
+                        [item.id for item in items]
+                    )
+                )
+            ) if items else None
+            chunks_by_item: dict[UUID, list[IngestionChunk]] = {}
+            if chunk_result is not None:
+                for chunk in chunk_result.scalars().all():
+                    chunks_by_item.setdefault(chunk.ingestion_item_id, []).append(chunk)
+
+            for item in items:
+                item_chunks = chunks_by_item.get(item.id, [])
+                if not item_chunks:
+                    continue
+                if all(chunk.status == "COMPLETED" for chunk in item_chunks):
+                    item.status = IngestionItemStatus.COMPLETED
+                    item.current_stage = None
+                    item.last_error = None
+                elif any(chunk.status == "FAILED" for chunk in item_chunks):
+                    item.status = IngestionItemStatus.FAILED
+                    item.last_error = next(
+                        (
+                            chunk.last_error
+                            for chunk in item_chunks
+                            if chunk.status == "FAILED" and chunk.last_error
+                        ),
+                        "One or more CSV chunks failed.",
+                    )
+
             result = await db.execute(
                 select(IngestionItem.status).where(IngestionItem.batch_id == ingestion_batch_id)
             )

@@ -97,7 +97,7 @@ async def validate_document_uploads(files: list[UploadFile]) -> tuple[list[Uploa
         if ext not in ALLOWED_EXTENSIONS:
             invalid_files.append({
                 "filename": f.filename,
-                "reason": f"Unsupported file type. Allowed: {', '.join(ALLOWED_EXTENSIONS)}"
+                "reason": f"Unsupported file type {ext} Allowed: {', '.join(ALLOWED_EXTENSIONS)}"
             })
             continue
 
@@ -186,21 +186,29 @@ async def validate_zip_safety(data: bytes) -> list[str]:
 async def stage_files_to_s3(
     batch_id: str,
     files: list[UploadFile],
-) -> tuple[str, str]:
+) -> tuple[str, str, list[tuple[str, str]]]:
     s3_prefix = f"document-batches/{batch_id}/original"
     source_type = "single" if len(files) == 1 else "multi"
+    staged_files: list[tuple[str, str]] = []
 
-    for f in files:
+    for index, f in enumerate(files):
         if Path(f.filename).suffix.lower() == ".zip":
             source_type = "zip"
 
-        key = f"{s3_prefix}/{f.filename}"
+        display_name = Path(f.filename.replace("\\", "/")).name
+        if not display_name or display_name in {".", ".."} or ":" in display_name:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Uploaded file has an invalid filename.",
+            )
+        key = f"{s3_prefix}/{index}_{display_name}"
         content_type = f.content_type or "application/octet-stream"
         await asyncio.to_thread(
             upload_fileobj_to_s3, key, f.file, content_type=content_type
         )
+        staged_files.append((key, display_name))
 
-    return s3_prefix, source_type
+    return s3_prefix, source_type, staged_files
 
 
 # =========================================================================
@@ -208,11 +216,17 @@ async def stage_files_to_s3(
 # =========================================================================
 
 _BATCH_PENDING_KEY = "campaign:{batch_id}:pending"
+CALL_PAUSE_KEY = "campaign:{campaign_id}:pause"
 _BATCH_TTL = 7 * 86400  # 7 days
 
 
 async def create_batch_tracker(redis: Redis, batch_id: str, file_count: int) -> None:
     now = datetime.now(timezone.utc).isoformat()
+    await redis.delete(
+        f"job:{batch_id}",
+        _BATCH_PENDING_KEY.format(batch_id=batch_id),
+        f"job:{batch_id}:adjustments",
+    )
     await redis.hset(  # type: ignore
         f"job:{batch_id}",
         mapping={
@@ -232,6 +246,7 @@ async def update_batch_progress(
     batch_id: str,
     *,
     total_candidates: int | None = None,
+    total_candidates_incr: int = 0,
     processed_incr: int = 0,
     failed_incr: int = 0,
     status: str | None = None,
@@ -239,6 +254,8 @@ async def update_batch_progress(
     pipe = redis.pipeline(transaction=True)
     if total_candidates is not None:
         pipe.hset(f"job:{batch_id}", "total_candidates", str(total_candidates))
+    if total_candidates_incr:
+        pipe.hincrby(f"job:{batch_id}", "total_candidates", total_candidates_incr)
     if processed_incr:
         pipe.hincrby(f"job:{batch_id}", "processed", processed_incr)
     if failed_incr:
@@ -313,6 +330,63 @@ async def batch_mark_done(redis: Redis, batch_id: str, item_id: str) -> bool:
     results = await pipe.execute()
     remaining: int = results[1]
     return remaining == 0
+
+
+async def batch_mark_done_with_progress(
+    redis: Redis,
+    batch_id: str,
+    item_id: str,
+    *,
+    failed: bool = False,
+) -> bool:
+    """Atomically remove a work unit and count its result once, even on retries."""
+    pending_key = _BATCH_PENDING_KEY.format(batch_id=batch_id)
+    job_key = f"job:{batch_id}"
+    progress_field = "failed" if failed else "processed"
+    script = """
+    local removed = redis.call('SREM', KEYS[1], ARGV[1])
+    if removed == 1 then
+        redis.call('HINCRBY', KEYS[2], ARGV[2], 1)
+        redis.call('HSET', KEYS[2], 'updated_at', ARGV[3])
+    end
+    return redis.call('SCARD', KEYS[1])
+    """
+    remaining = await redis.eval(
+        script,
+        2,
+        pending_key,
+        job_key,
+        item_id,
+        progress_field,
+        datetime.now(timezone.utc).isoformat(),
+    )
+    return int(remaining) == 0
+
+
+async def adjust_batch_total_once(
+    redis: Redis,
+    batch_id: str,
+    adjustment_id: str,
+    delta: int,
+) -> None:
+    """Apply one work-unit expansion only once across dispatcher retries."""
+    script = """
+    local added = redis.call('SADD', KEYS[1], ARGV[1])
+    if added == 1 then
+        redis.call('HINCRBY', KEYS[2], 'total_candidates', ARGV[2])
+        redis.call('EXPIRE', KEYS[1], ARGV[3])
+    end
+    return added
+    """
+    await redis.eval(
+        script,
+        2,
+        f"job:{batch_id}:adjustments",
+        f"job:{batch_id}",
+        adjustment_id,
+        delta,
+        _BATCH_TTL,
+    )
 
 
 # =========================================================================
@@ -403,10 +477,10 @@ async def pause_calling_batch(
     Also marks uncalled candidates as PAUSED so resumption knows which ones
     still need to be dialled.
     """
-    # Update Redis tracker for UI visibility
     await update_batch_progress(redis, batch_id, status="PAUSED")
+    pause_key = CALL_PAUSE_KEY.format(campaign_id=str(campaign_id))
+    await redis.set(pause_key, "1", ex=86400)
 
-    # Mark all candidates that are currently pending/ready for calling as PAUSED
     stmt = (
         select(Candidate)
         .where(
@@ -434,15 +508,11 @@ async def resume_calling_batch(
     """Resume a paused calling batch.
 
     Resets PAUSED candidates back to PENDING in Postgres and fans out new
-    atomic call tasks into ARQ — one per candidate.  No Redis flags to clear.
+    atomic call tasks into ARQ — one per candidate.
     """
-    from arq import create_pool
-    from arq.connections import RedisSettings
-    from uuid6 import uuid7
-
     await update_batch_progress(redis, batch_id, status="PROCESSING")
+    await redis.delete(CALL_PAUSE_KEY.format(campaign_id=str(campaign_id)))
 
-    # Find candidates that were paused
     stmt = (
         select(Candidate)
         .where(
@@ -462,21 +532,13 @@ async def resume_calling_batch(
     if not candidate_ids:
         return 0
 
-    # Re-initialise the Redis pending Set for the resumed batch
     await batch_add_pending(redis, batch_id, candidate_ids)
-
-    # Fan out one atomic call task per candidate
-    pool = await create_pool(RedisSettings.from_dsn(settings.REDIS_URL))
-    try:
-        for cid in candidate_ids:
-            await pool.enqueue_job(
-                "call_single_candidate",
-                campaign_id=str(campaign_id),
-                candidate_id=cid,
-                batch_id=batch_id,
-            )
-    finally:
-        await pool.aclose()
+    await enqueue_campaign_calling(
+        redis,
+        batch_id=batch_id,
+        campaign_id=str(campaign_id),
+        candidate_ids=candidate_ids,
+    )
 
     return len(candidates)
 
@@ -731,16 +793,22 @@ async def persist_csv_candidate(
     *,
     campaign_id,
     ingestion_item_id,
+    source_row_key: str,
     source_url: str,
     extracted_fields: dict[str, Any],
-) -> Candidate:
+) -> tuple[Candidate, bool]:
     """Create a Candidate from a single CSV row.
 
-    Unlike ``persist_candidate_from_ingestion``, multiple candidates can originate
-    from the same parent CSV file. Because ``Candidate.ingestion_item_id`` has a UNIQUE
-    constraint, we do NOT assign ``ingestion_item_id`` directly to avoid collisions;
-    instead we record ``source_ingestion_item_id`` inside ``extracted_fields``.
+    A stable source row key makes CSV retries idempotent while allowing multiple
+    candidates to originate from the same ingestion item.
     """
+    existing_result = await db.execute(
+        select(Candidate).where(Candidate.source_row_key == source_row_key)
+    )
+    existing_candidate = existing_result.scalar_one_or_none()
+    if existing_candidate is not None:
+        return existing_candidate, False
+
     core_fields = dict(extracted_fields.get("extracted_fields") or {})
     if ingestion_item_id is not None:
         core_fields["source_ingestion_item_id"] = str(ingestion_item_id)
@@ -757,13 +825,14 @@ async def persist_csv_candidate(
         phone=extracted_fields.get("phone"),
         file_url=source_url,
         ingestion_item_id=None,
+        source_row_key=source_row_key,
         extracted_fields=core_fields,
         workflow_step="document_extraction",
         step_status=WorkflowStepStatus.COMPLETED,
     )
     db.add(candidate)
     await db.flush()
-    return candidate
+    return candidate, True
 
 
 # =========================================================================
@@ -790,14 +859,14 @@ async def process_call_webhook(payload: CallWebhookPayload) -> None:
             )
             candidate = candidate_result.scalar_one_or_none()
             if not candidate:
-                raise HTTPException(status_code=404, detail="Candidate not found")
+                raise ValueError("Candidate not found")
 
             campaign_result = await db.execute(
                 select(Campaign).where(Campaign.id == payload.campaign_id)
             )
             campaign = campaign_result.scalar_one_or_none()
             if not campaign:
-                raise HTTPException(status_code=404, detail="Campaign not found")
+                raise ValueError("Campaign not found")
 
             candidate_fields = dict(candidate.extracted_fields or {})
             campaign_text = campaign.raw_text or ""
@@ -825,7 +894,7 @@ async def process_call_webhook(payload: CallWebhookPayload) -> None:
             )
             candidate = candidate_result.scalar_one_or_none()
             if not candidate:
-                raise HTTPException(status_code=404, detail="Candidate not found")
+                raise ValueError("Candidate not found")
 
             call_screening = CallScreening(
                 call_id=payload.call_id,
