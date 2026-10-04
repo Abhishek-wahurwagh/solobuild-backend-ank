@@ -13,7 +13,7 @@ from app.core.database import Base
 from app.domains.users.models import User
 from app.domains.agents.models import Agent, AgentPreset
 from app.domains.campaigns.models import WorkflowTemplate, Campaign, Candidate, DocumentScreening, CallScreening, WorkflowEventLog
-from app.domains.ingestion.models import IngestionBatch, IngestionItem
+from app.domains.ingestion.models import IngestionBatch, IngestionItem, IngestionChunk
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
@@ -96,4 +96,3 @@ if context.is_offline_mode():
     run_migrations_offline()
 else:
     run_migrations_online()
-

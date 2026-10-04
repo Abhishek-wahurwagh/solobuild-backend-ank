@@ -23,9 +23,9 @@ class Settings(BaseSettings):
     AWS_REGION: str = ""
 
     AI_EMBEDDING_PROVIDER: str = "gemini"
-    GEMINI_API_KEY: str = "your-gemini-key"
-    GEMINI_EMBEDDING_MODEL: str = "models/text-embedding-004"
-    GEMINI_EXTRACTION_MODEL: str = "gemini-1.5-flash"
+    GEMINI_API_KEY: str = ""
+    CORS_ALLOWED_ORIGINS: list[str] = ["http://localhost:3000"]
+    GEMINI_EXTRACTION_MODEL: str = ""
     LLM_REQUEST_TIMEOUT_SECONDS: int = 180
     LLM_MAX_RETRIES: int = 2
     LLM_RETRY_DELAY_SECONDS: float = 2.0
