@@ -11,8 +11,8 @@ async def run_vobiz_session(websocket: Any, *, system_prompt: str) -> None:
         from pipecat.audio.vad.silero import SileroVADAnalyzer
         from pipecat.pipeline.pipeline import Pipeline
         from pipecat.pipeline.task import PipelineParams, PipelineTask
-        from pipecat.processors.aggregators.llm_context import (
-            LLMContext,
+        from pipecat.processors.aggregators.llm_context import LLMContext
+        from pipecat.processors.aggregators.llm_response_universal import (
             LLMContextAggregatorPair,
             LLMUserAggregatorParams,
         )

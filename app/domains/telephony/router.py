@@ -1,10 +1,12 @@
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Request, Response, WebSocket, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, WebSocket, status
 
 from app.core.database import AsyncSessionLocal
 from app.core.config import settings
+from app.domains.auth.dependencies import get_current_user
 from app.domains.campaigns.models import Campaign
+from app.domains.users.models import User
 from app.domains.telephony.schemas import CallCompletionWebhook, CallInitiationRequest, CallInitiationResponse, CallStatusResponse
 from app.domains.telephony.service import (
     build_system_prompt,
@@ -23,12 +25,18 @@ router = APIRouter(prefix="/telephony")
 
 
 @router.post("/calls/initiate", response_model=CallInitiationResponse, status_code=status.HTTP_200_OK)
-async def initiate_call_endpoint(request: CallInitiationRequest):
+async def initiate_call_endpoint(
+    request: CallInitiationRequest,
+    current_user: User = Depends(get_current_user),
+):
     return await initiate_outbound_call(request)
 
 
 @router.get("/calls/{call_id}/status", response_model=CallStatusResponse, status_code=status.HTTP_200_OK)
-async def call_status_endpoint(call_id: str):
+async def call_status_endpoint(
+    call_id: str,
+    current_user: User = Depends(get_current_user),
+):
     data = await get_call_status(call_id)
     if data is None:
         raise HTTPException(status_code=404, detail="Call status not found.")
