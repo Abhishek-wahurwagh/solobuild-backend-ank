@@ -15,7 +15,7 @@ class AgentCreate(BaseModel):
     conversation_style: ConversationStyle
     languages: LanguagePreference
     voice: VoicePreference
-    interview_instruction: Annotated[str, Field(min_length=3, max_length=2000)]
+    interview_instruction: Annotated[str, Field(max_length=2000)]
 
     model_config = ConfigDict(use_enum_values=True)
 
