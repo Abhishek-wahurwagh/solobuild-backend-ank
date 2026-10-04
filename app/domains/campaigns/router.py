@@ -95,6 +95,37 @@ async def create_campaign(
     return campaign
 
 
+@router.get("/", response_model=list[CampaignResponse])
+async def list_campaigns(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(Campaign)
+        .where(Campaign.created_by_user_id == current_user.id)
+        .order_by(Campaign.created_at.desc())
+    )
+    return result.scalars().all()
+
+
+@router.get("/{campaign_id}", response_model=CampaignResponse)
+async def get_campaign(
+    campaign_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(Campaign).where(
+            Campaign.id == campaign_id,
+            Campaign.created_by_user_id == current_user.id,
+        )
+    )
+    campaign = result.scalar_one_or_none()
+    if campaign is None:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    return campaign
+
+
 @router.patch("/{campaign_id}", response_model=CampaignResponse)
 async def update_campaign(
     campaign_id: UUID,
@@ -176,6 +207,15 @@ async def update_candidate(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    campaign_result = await db.execute(
+        select(Campaign).where(
+            Campaign.id == campaign_id,
+            Campaign.created_by_user_id == current_user.id,
+        )
+    )
+    if campaign_result.scalar_one_or_none() is None:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
     result = await db.execute(
         select(Candidate).where(
             Candidate.id == candidate_id,
@@ -222,16 +262,27 @@ async def upload_candidates(
         raise HTTPException(status_code=404, detail="Campaign not found.")
 
     valid_files, invalid_files = await validate_document_uploads(files)
+    if not valid_files:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "message": "No uploaded files passed validation.",
+                "rejected_files": invalid_files,
+            },
+        )
     batch_uuid = uuid7()
     batch_id = f"batch_{batch_uuid}"
-    s3_prefix, source_type = await stage_files_to_s3(batch_id, valid_files)
+    s3_prefix, source_type, staged_files = await stage_files_to_s3(
+        batch_id,
+        valid_files,
+    )
 
     ingestion_items = [
         {
-            "source_key": f"{s3_prefix}/{file.filename}",
-            "display_name": file.filename or "unknown",
+            "source_key": source_key,
+            "display_name": display_name,
         }
-        for file in valid_files
+        for source_key, display_name in staged_files
     ]
     await create_ingestion_batch(
         db,
