@@ -42,9 +42,5 @@ Thumbs.db
 
 docs/
 tests/
-test_*.py
-*_test.py
 
-!tests/
-tests/*
-!tests/test_candidate_workflow_state.py
+.agents/
