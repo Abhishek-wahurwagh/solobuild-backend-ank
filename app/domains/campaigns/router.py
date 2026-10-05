@@ -29,6 +29,7 @@ from app.domains.campaigns.schemas import (
     BatchUploadResponse,
     CampaignFieldsUpdate,
     CampaignResponse,
+    CampaignListResponse,
     CandidateResponse,
     ScreeningBatchResponse,
     ScreeningRequest,
@@ -102,7 +103,7 @@ async def create_campaign(
     return campaign
 
 
-@router.get("/", response_model=list[CampaignResponse])
+@router.get("/", response_model=list[CampaignListResponse])
 async def list_campaigns(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -185,7 +186,7 @@ async def update_campaign_fields(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Directly overwrite campaign required_fields without re-extracting via LLM. Accepts JSON body."""
+    """Merge incoming values into campaign required_fields without discarding existing data."""
     result = await db.execute(
         select(Campaign).where(
             Campaign.id == campaign_id,
@@ -196,7 +197,10 @@ async def update_campaign_fields(
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
 
-    campaign.required_fields = body.required_fields
+    campaign.required_fields = {
+        **(campaign.required_fields or {}),
+        **body.required_fields,
+    }
 
     await db.commit()
     await db.refresh(campaign)

@@ -32,6 +32,15 @@ class CampaignResponse(BaseModel):
     updated_at: datetime
     model_config = ConfigDict(from_attributes=True)
 
+class CampaignListResponse(BaseModel):
+    id: UUID
+    title: str
+    workflow_template_id: UUID | None
+    agent_id: UUID | None
+    created_at: datetime
+    updated_at: datetime
+    model_config = ConfigDict(from_attributes=True)
+
 
 class CandidateResponse(BaseModel):
     id: UUID
@@ -97,7 +106,7 @@ class BatchUploadResponse(BaseModel):
 
 
 class CampaignFieldsUpdate(BaseModel):
-    """JSON body for directly overwriting campaign required_fields."""
+    """JSON body for merging into campaign required_fields without discarding existing values."""
     required_fields: dict
 
 
