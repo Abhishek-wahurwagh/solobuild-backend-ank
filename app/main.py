@@ -1,4 +1,6 @@
 from contextlib import asynccontextmanager
+import asyncio
+
 from fastapi import FastAPI, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
@@ -7,6 +9,7 @@ from sqlalchemy import text
 from app.core.config import settings
 from app.core.database import engine
 from app.core.redis import get_redis_client, close_redis_pool
+from app.core.s3 import check_s3_bucket_access
 
 from app.domains.auth.router import router as auth_router
 from app.domains.agents.router import router as agents_router
@@ -21,6 +24,14 @@ from app.domains.analytics.router import router as analytics_router
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # -- Startup --
+
+    # Check configured S3 bucket access without blocking the event loop.
+    try:
+        await asyncio.to_thread(check_s3_bucket_access)
+        print("✅ S3 bucket connection established successfully.")
+    except Exception as e:
+        print(f"❌ Failed to connect to S3: {e}")
+    
     try:
         async with engine.begin() as conn:
             await conn.execute(text("SELECT 1;"))
