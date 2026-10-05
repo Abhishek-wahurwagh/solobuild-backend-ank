@@ -75,7 +75,12 @@ async def create_campaign(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    resulting_raw_text = await build_campaign_raw_text(raw_text, file)
+    campaign_id = uuid7()
+    resulting_raw_text, file_url = await build_campaign_raw_text(
+        raw_text,
+        file,
+        campaign_id=campaign_id,
+    )
     if not resulting_raw_text:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -84,9 +89,11 @@ async def create_campaign(
 
     extracted_fields = await extract_document_fields_llm(resulting_raw_text)
     campaign = Campaign(
+        id=campaign_id,
         title=title,
         raw_text=resulting_raw_text,
         required_fields={**extracted_fields, **(required_fields or {})},
+        file_url=file_url,
         created_by_user_id=current_user.id,
     )
     db.add(campaign)
@@ -148,7 +155,11 @@ async def update_campaign(
         raise HTTPException(status_code=404, detail="Campaign not found")
 
     if raw_text is not None or file is not None:
-        campaign.raw_text = await build_campaign_raw_text(raw_text, file)
+        campaign.raw_text, campaign.file_url = await build_campaign_raw_text(
+            raw_text,
+            file,
+            campaign_id=campaign.id,
+        )
         extracted_fields = await extract_campaign_requirements_llm(
             campaign.raw_text,
         )

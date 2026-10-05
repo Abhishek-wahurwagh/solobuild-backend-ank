@@ -75,6 +75,17 @@ def upload_bytes_to_s3(
     return f"s3://{bucket}/{key}"
 
 
+def delete_s3_object(
+    key: str,
+    *,
+    bucket: str | None = None,
+) -> None:
+    """Delete an S3 object by key."""
+    bucket = bucket or settings.AWS_BUCKET_NAME
+    client = get_s3_client()
+    client.delete_object(Bucket=bucket, Key=key)
+
+
 def download_s3_prefix(
     prefix: str,
     local_dir: Path,

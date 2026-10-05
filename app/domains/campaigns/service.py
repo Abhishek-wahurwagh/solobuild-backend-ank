@@ -12,21 +12,24 @@ Contains:
 """
 from __future__ import annotations
 from uuid import UUID
+from uuid6 import uuid7
 
 import asyncio
 import io
+import logging
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from fastapi import HTTPException, UploadFile, status
+from botocore.exceptions import BotoCoreError, ClientError
 from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.s3 import upload_fileobj_to_s3
+from app.core.s3 import delete_s3_object, upload_bytes_to_s3, upload_fileobj_to_s3
 from app.domains.campaigns.models import (
     CallScreening,
     Campaign,
@@ -45,6 +48,8 @@ from app.domains.ingestion.text import (
     normalize_text,
     validate_magic_bytes,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # =========================================================================
@@ -550,7 +555,9 @@ async def resume_calling_batch(
 async def build_campaign_raw_text(
     raw_text: str | None,
     uploaded_file: UploadFile | None,
-) -> str | None:
+    *,
+    campaign_id: UUID,
+) -> tuple[str | None, str | None]:
     if raw_text is not None and uploaded_file is not None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -563,7 +570,7 @@ async def build_campaign_raw_text(
         candidate_parts.append(raw_text.strip())
 
     if uploaded_file is None:
-        return "\n\n".join(candidate_parts) if candidate_parts else None
+        return ("\n\n".join(candidate_parts) if candidate_parts else None), None
 
     filename = uploaded_file.filename or ""
     if not filename:
@@ -592,15 +599,73 @@ async def build_campaign_raw_text(
             detail=f"Uploaded file does not match the expected {ext.upper()} signature.",
         )
 
-    extracted = extract_document_text(file_bytes, ext)
-    if not extracted or not extracted.strip():
+    display_name = Path(filename.replace("\\", "/")).name
+    key = f"campaign-requirements/{campaign_id}/{uuid7()}_{display_name}"
+    content_type = uploaded_file.content_type or "application/octet-stream"
+    extraction_task = asyncio.create_task(
+        asyncio.to_thread(extract_document_text, file_bytes, ext)
+    )
+    upload_task = asyncio.create_task(
+        asyncio.to_thread(
+            upload_bytes_to_s3,
+            key,
+            file_bytes,
+            content_type=content_type,
+        )
+    )
+    extracted, file_url = await asyncio.gather(
+        extraction_task,
+        upload_task,
+        return_exceptions=True,
+    )
+
+    if isinstance(file_url, (BotoCoreError, ClientError)):
+        logger.error(
+            "Failed to upload campaign requirement file to S3 for campaign %s.",
+            campaign_id,
+            exc_info=(type(file_url), file_url, file_url.__traceback__),
+        )
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Could not store the campaign requirement file. Check S3 configuration and try again.",
+        ) from file_url
+    if isinstance(file_url, BaseException):
+        raise file_url
+
+    if isinstance(extracted, BaseException):
+        if isinstance(extracted, asyncio.CancelledError):
+            await _delete_campaign_requirement_file(key, campaign_id)
+            raise extracted
+        logger.error(
+            "Failed to extract campaign requirement file for campaign %s.",
+            campaign_id,
+            exc_info=(type(extracted), extracted, extracted.__traceback__),
+        )
+        await _delete_campaign_requirement_file(key, campaign_id)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Could not extract text from the campaign requirement file.",
+        ) from extracted
+
+    if not extracted or not extracted.strip():
+        await _delete_campaign_requirement_file(key, campaign_id)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="Uploaded requirement file did not produce usable text.",
         )
 
     candidate_parts.append(extracted.strip())
-    return "\n\n".join(candidate_parts)
+    return "\n\n".join(candidate_parts), file_url
+
+
+async def _delete_campaign_requirement_file(key: str, campaign_id: UUID) -> None:
+    try:
+        await asyncio.to_thread(delete_s3_object, key)
+    except (BotoCoreError, ClientError):
+        logger.exception(
+            "Failed to clean up campaign requirement file in S3 for campaign %s.",
+            campaign_id,
+        )
 
 
 async def extract_campaign_requirements_llm(
