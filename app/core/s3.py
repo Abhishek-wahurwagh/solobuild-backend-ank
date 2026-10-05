@@ -37,6 +37,11 @@ def get_s3_client():
     return _client
 
 
+def check_s3_bucket_access() -> None:
+    """Verify that the configured S3 bucket is accessible."""
+    get_s3_client().head_bucket(Bucket=settings.AWS_BUCKET_NAME)
+
+
 def upload_fileobj_to_s3(
     key: str,
     file_obj: BinaryIO,
