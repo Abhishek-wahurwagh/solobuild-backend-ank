@@ -287,10 +287,20 @@ async def upload_candidates(
         )
     batch_uuid = uuid7()
     batch_id = f"batch_{batch_uuid}"
-    s3_prefix, source_type, staged_files = await stage_files_to_s3(
+    s3_prefix, source_type, staged_files, upload_failures = await stage_files_to_s3(
         batch_id,
         valid_files,
     )
+    rejected_files = [*invalid_files, *upload_failures]
+
+    if not staged_files:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "message": "None of the candidate files could be stored.",
+                "rejected_files": rejected_files,
+            },
+        )
 
     ingestion_items = [
         {
@@ -311,7 +321,7 @@ async def upload_candidates(
 
     redis = await get_redis_client()
     try:
-        await create_batch_tracker(redis, batch_id, file_count=len(files))
+        await create_batch_tracker(redis, batch_id, file_count=len(staged_files))
         await enqueue_document_upload_batch(
             redis,
             batch_id=batch_id,
@@ -325,8 +335,9 @@ async def upload_candidates(
     return BatchUploadResponse(
         batch_id=batch_id,
         status="QUEUED",
-        accepted_candidates=len(valid_files),
-        rejected_candidates=len(invalid_files)
+        accepted_candidates=len(staged_files),
+        rejected_candidates=len(rejected_files),
+        rejected_files=rejected_files,
     )
 
 

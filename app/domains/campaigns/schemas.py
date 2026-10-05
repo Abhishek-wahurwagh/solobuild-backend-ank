@@ -98,11 +98,17 @@ class CallWebhookPayload(BaseModel):
     recording_url: str | None = None
 
 
+class RejectedUploadFile(BaseModel):
+    filename: str
+    reason: str
+
+
 class BatchUploadResponse(BaseModel):
     batch_id: str
     status: str
     accepted_candidates: int
     rejected_candidates: int
+    rejected_files: list[RejectedUploadFile] = Field(default_factory=list)
 
 
 class CampaignFieldsUpdate(BaseModel):

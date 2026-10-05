@@ -23,13 +23,18 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import HTTPException, UploadFile, status
+from boto3.s3.transfer import S3UploadFailedError
 from botocore.exceptions import BotoCoreError, ClientError
 from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.s3 import delete_s3_object, upload_bytes_to_s3, upload_fileobj_to_s3
+from app.core.s3 import (
+    delete_s3_object,
+    upload_bytes_to_s3,
+    upload_fileobj_to_s3,
+)
 from app.domains.campaigns.models import (
     CallScreening,
     Campaign,
@@ -191,15 +196,13 @@ async def validate_zip_safety(data: bytes) -> list[str]:
 async def stage_files_to_s3(
     batch_id: str,
     files: list[UploadFile],
-) -> tuple[str, str, list[tuple[str, str]]]:
+) -> tuple[str, str, list[tuple[str, str]], list[dict[str, str]]]:
     s3_prefix = f"document-batches/{batch_id}/original"
-    source_type = "single" if len(files) == 1 else "multi"
     staged_files: list[tuple[str, str]] = []
+    failed_files: list[dict[str, str]] = []
+    files_to_stage: list[tuple[UploadFile, str, str]] = []
 
     for index, f in enumerate(files):
-        if Path(f.filename).suffix.lower() == ".zip":
-            source_type = "zip"
-
         display_name = Path(f.filename.replace("\\", "/")).name
         if not display_name or display_name in {".", ".."} or ":" in display_name:
             raise HTTPException(
@@ -207,13 +210,48 @@ async def stage_files_to_s3(
                 detail="Uploaded file has an invalid filename.",
             )
         key = f"{s3_prefix}/{index}_{display_name}"
+        files_to_stage.append((f, key, display_name))
+
+    for f, key, display_name in files_to_stage:
         content_type = f.content_type or "application/octet-stream"
-        await asyncio.to_thread(
-            upload_fileobj_to_s3, key, f.file, content_type=content_type
-        )
+        try:
+            await asyncio.to_thread(
+                upload_fileobj_to_s3, key, f.file, content_type=content_type
+            )
+        except (BotoCoreError, ClientError, S3UploadFailedError) as exc:
+            logger.exception(
+                "Failed to stage candidate upload to S3 for batch %s (key %s).",
+                batch_id,
+                key,
+            )
+            await _delete_staged_s3_objects([key], batch_id)
+            failed_files.append({
+                "filename": display_name,
+                "reason": "Could not store this file. Check S3 configuration and try again.",
+            })
+            continue
         staged_files.append((key, display_name))
 
-    return s3_prefix, source_type, staged_files
+    if any(Path(name).suffix.lower() == ".zip" for _, name in staged_files):
+        source_type = "zip"
+    elif len(staged_files) == 1:
+        source_type = "single"
+    else:
+        source_type = "multi"
+
+    return s3_prefix, source_type, staged_files, failed_files
+
+
+async def _delete_staged_s3_objects(keys: list[str], batch_id: str) -> None:
+    for key in keys:
+        try:
+            await asyncio.to_thread(delete_s3_object, key)
+        except (BotoCoreError, ClientError, S3UploadFailedError):
+            logger.exception(
+                "Failed to clean up staged candidate file for batch %s (key %s).",
+                batch_id,
+                key,
+            )
 
 
 # =========================================================================
@@ -625,9 +663,18 @@ async def build_campaign_raw_text(
             campaign_id,
             exc_info=(type(file_url), file_url, file_url.__traceback__),
         )
+        await _delete_campaign_requirement_file(key, campaign_id)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Could not store the campaign requirement file. Check S3 configuration and try again.",
+            detail={
+                "message": "Could not store the campaign requirement file.",
+                "rejected_files": [
+                    {
+                        "filename": display_name,
+                        "reason": "Check S3 configuration and try again.",
+                    }
+                ],
+            },
         ) from file_url
     if isinstance(file_url, BaseException):
         raise file_url
