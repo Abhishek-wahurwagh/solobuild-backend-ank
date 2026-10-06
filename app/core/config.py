@@ -24,7 +24,7 @@ class Settings(BaseSettings):
 
     AI_EMBEDDING_PROVIDER: str = "gemini"
     GEMINI_API_KEY: str = ""
-    CORS_ALLOWED_ORIGINS: list[str] = ["http://localhost:3000"]
+    CORS_ALLOWED_ORIGINS: list[str] = ["http://localhost:5173"]
     GEMINI_EXTRACTION_MODEL: str = ""
     GEMINI_CHAT_MODEL: str = "gemini-2.0-flash"
     GEMINI_SUMMARY_MODEL: str = "gemini-2.0-flash-lite"

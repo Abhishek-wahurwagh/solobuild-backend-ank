@@ -63,20 +63,29 @@ class CandidateResponse(BaseModel):
 
 class DocumentScreeningResponse(BaseModel):
     id: UUID
+    campaign_id: UUID
+    candidate_id: UUID
     match_score: float | None
     matched_fields: dict | None
     unmatched_fields: dict | None
     summary: str | None
+    created_at: datetime
+    updated_at: datetime
     model_config = ConfigDict(from_attributes=True)
 
 class CallScreeningResponse(BaseModel):
     id: UUID
+    campaign_id: UUID
+    candidate_id: UUID
+    call_id: str | None
     transcript: str | None
     recording_url: str | None
     match_score: float | None
     matched_fields: dict | None
     unmatched_fields: dict | None
     summary: str | None
+    created_at: datetime
+    updated_at: datetime
     model_config = ConfigDict(from_attributes=True)
 
 class WorkflowEventLogResponse(BaseModel):

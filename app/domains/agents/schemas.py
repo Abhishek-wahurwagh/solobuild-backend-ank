@@ -27,12 +27,9 @@ class AgentResponse(BaseModel):
     languages: LanguagePreference
     voice: VoicePreference
     interview_instruction: str
+    is_preset: bool = False
 
     model_config = ConfigDict(from_attributes=True, use_enum_values=True)
-
-
-class AgentListItem(AgentResponse):
-    is_preset: bool = False
 
 
 class AgentUpdate(BaseModel):

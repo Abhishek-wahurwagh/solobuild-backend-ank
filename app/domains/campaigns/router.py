@@ -20,8 +20,10 @@ from app.core.database import get_db
 from app.core.redis import get_redis_client
 from app.domains.auth.dependencies import get_current_user
 from app.domains.campaigns.models import (
+    CallScreening,
     Campaign,
     Candidate,
+    DocumentScreening,
     WorkflowStepStatus,
 )
 from app.domains.campaigns.schemas import (
@@ -31,6 +33,8 @@ from app.domains.campaigns.schemas import (
     CampaignResponse,
     CampaignListResponse,
     CandidateResponse,
+    CallScreeningResponse,
+    DocumentScreeningResponse,
     ScreeningBatchResponse,
     ScreeningRequest,
     CallingRequest,
@@ -133,14 +137,14 @@ async def get_campaign(
         raise HTTPException(status_code=404, detail="Campaign not found")
     return campaign
 
-
 @router.patch("/{campaign_id}", response_model=CampaignResponse)
 async def update_campaign(
     campaign_id: UUID,
-    title: str = Form(...),
+    title: str | None = Form(None),
     raw_text: str | None = Form(None),
     required_fields: Json[dict[str, Any]] | None = Form(None),
     file: UploadFile | None = File(None),
+    agent_id: UUID | None = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -173,6 +177,9 @@ async def update_campaign(
 
     if title:
         campaign.title = title
+
+    if agent_id:
+        campaign.agent_id = agent_id
 
     await db.commit()
     await db.refresh(campaign)
@@ -508,6 +515,136 @@ async def get_candidates(
     return result.scalars().all()
 
 
+@router.get(
+    "/{campaign_id}/document-screenings",
+    response_model=list[DocumentScreeningResponse],
+)
+async def get_campaign_document_screenings(
+    campaign_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    campaign_result = await db.execute(
+        select(Campaign).where(
+            Campaign.id == campaign_id,
+            Campaign.created_by_user_id == current_user.id,
+        )
+    )
+    if campaign_result.scalar_one_or_none() is None:
+        raise HTTPException(status_code=404, detail="Campaign not found.")
+
+    result = await db.execute(
+        select(DocumentScreening)
+        .where(DocumentScreening.campaign_id == campaign_id)
+        .order_by(DocumentScreening.created_at.desc())
+    )
+    return result.scalars().all()
+
+
+@router.get(
+    "/{campaign_id}/candidates/{candidate_id}/document-screenings",
+    response_model=list[DocumentScreeningResponse],
+)
+async def get_candidate_document_screenings(
+    campaign_id: UUID,
+    candidate_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    campaign_result = await db.execute(
+        select(Campaign).where(
+            Campaign.id == campaign_id,
+            Campaign.created_by_user_id == current_user.id,
+        )
+    )
+    if campaign_result.scalar_one_or_none() is None:
+        raise HTTPException(status_code=404, detail="Campaign not found.")
+
+    candidate_result = await db.execute(
+        select(Candidate).where(
+            Candidate.id == candidate_id,
+            Candidate.campaign_id == campaign_id,
+        )
+    )
+    if candidate_result.scalar_one_or_none() is None:
+        raise HTTPException(status_code=404, detail="Candidate not found.")
+
+    result = await db.execute(
+        select(DocumentScreening)
+        .where(
+            DocumentScreening.campaign_id == campaign_id,
+            DocumentScreening.candidate_id == candidate_id,
+        )
+        .order_by(DocumentScreening.created_at.desc())
+    )
+    return result.scalars().all()
+
+
+@router.get(
+    "/{campaign_id}/call-screenings",
+    response_model=list[CallScreeningResponse],
+)
+async def get_campaign_call_screenings(
+    campaign_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    campaign_result = await db.execute(
+        select(Campaign).where(
+            Campaign.id == campaign_id,
+            Campaign.created_by_user_id == current_user.id,
+        )
+    )
+    if campaign_result.scalar_one_or_none() is None:
+        raise HTTPException(status_code=404, detail="Campaign not found.")
+
+    result = await db.execute(
+        select(CallScreening)
+        .where(CallScreening.campaign_id == campaign_id)
+        .order_by(CallScreening.created_at.desc())
+    )
+    return result.scalars().all()
+
+
+@router.get(
+    "/{campaign_id}/candidates/{candidate_id}/call-screenings",
+    response_model=list[CallScreeningResponse],
+)
+async def get_candidate_call_screenings(
+    campaign_id: UUID,
+    candidate_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    campaign_result = await db.execute(
+        select(Campaign).where(
+            Campaign.id == campaign_id,
+            Campaign.created_by_user_id == current_user.id,
+        )
+    )
+    if campaign_result.scalar_one_or_none() is None:
+        raise HTTPException(status_code=404, detail="Campaign not found.")
+
+    candidate_result = await db.execute(
+        select(Candidate).where(
+            Candidate.id == candidate_id,
+            Candidate.campaign_id == campaign_id,
+        )
+    )
+    if candidate_result.scalar_one_or_none() is None:
+        raise HTTPException(status_code=404, detail="Candidate not found.")
+
+    result = await db.execute(
+        select(CallScreening)
+        .where(
+            CallScreening.campaign_id == campaign_id,
+            CallScreening.candidate_id == candidate_id,
+        )
+        .order_by(CallScreening.created_at.desc())
+    )
+    return result.scalars().all()
+
+
 @router.post(
     "/{campaign_id}/candidates/screen",
     status_code=status.HTTP_202_ACCEPTED,
@@ -515,7 +652,7 @@ async def get_candidates(
 )
 async def screen_candidates(
     campaign_id: UUID,
-    request: ScreeningRequest,
+    candidate_ids: list[UUID] | None = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -532,7 +669,7 @@ async def screen_candidates(
     redis = await get_redis_client()
     try:
         await create_batch_tracker(redis, batch_id, file_count=0)
-        candidate_ids_str = [str(cid) for cid in request.candidate_ids] if request.candidate_ids else None
+        candidate_ids_str = [str(cid) for cid in candidate_ids] if candidate_ids else None
 
         await enqueue_campaign_screening(
             redis,
