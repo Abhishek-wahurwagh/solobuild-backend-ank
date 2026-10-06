@@ -3,6 +3,8 @@ from typing import Annotated
 from datetime import datetime
 from uuid import UUID
 
+from app.domains.users.enums import UserService
+
 
 class UserCreate(BaseModel):
     name: Annotated[str, Field(min_length=3, max_length=100)]
@@ -30,6 +32,7 @@ class UserResponse(BaseModel):
     name: str
     email: EmailStr
     timezone: str
+    services: list[UserService]
     created_at: datetime
     updated_at: datetime
     is_active: bool

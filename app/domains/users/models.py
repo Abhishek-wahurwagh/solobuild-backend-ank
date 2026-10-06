@@ -1,11 +1,19 @@
 import uuid
 from datetime import datetime
 from uuid6 import uuid7
-from sqlalchemy import String, Boolean, DateTime, func
+from sqlalchemy import Boolean, DateTime, Enum as SQLAlchemyEnum, String, func, text
 from sqlalchemy.orm import Mapped, mapped_column
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import ARRAY, UUID
 
 from app.core.database import Base
+from app.domains.users.enums import UserService
+
+
+user_service_enum = SQLAlchemyEnum(
+    UserService,
+    name="userservice",
+    values_callable=lambda enum_values: [service.value for service in enum_values],
+)
 
 
 class User(Base):
@@ -26,6 +34,13 @@ class User(Base):
     # Timezone field stored as IANA name (e.g. "Asia/Kolkata")
     timezone: Mapped[str] = mapped_column(
         String(50), nullable=False, default="UTC"
+    )
+
+    services: Mapped[list[UserService]] = mapped_column(
+        ARRAY(user_service_enum),
+        nullable=False,
+        default=list,
+        server_default=text("ARRAY[]::userservice[]"),
     )
 
     is_active: Mapped[bool] = mapped_column(
