@@ -15,9 +15,11 @@ class UIActionType(str, enum.Enum):
     # Campaign views
     SHOW_CAMPAIGN_LIST   = "SHOW_CAMPAIGN_LIST"     # renders CampaignListPanel
     SHOW_CAMPAIGN_DETAIL = "SHOW_CAMPAIGN_DETAIL"   # renders CampaignDetailPanel
+    SHOW_CAMPAIGN_CREATE_FORM = "SHOW_CAMPAIGN_CREATE_FORM"  # renders CampaignCreateModal/Form
 
     # Candidate views
     SHOW_CANDIDATE_LIST  = "SHOW_CANDIDATE_LIST"    # renders CandidateTablePanel
+    SHOW_CANDIDATE_UPLOAD = "SHOW_CANDIDATE_UPLOAD" # renders CandidateUploadModal/Dropzone
 
     # Batch / progress views
     SHOW_SCREENING_STATUS = "SHOW_SCREENING_STATUS" # renders BatchStatusPanel (screening)

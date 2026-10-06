@@ -34,7 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.domains.chat.models import ChatMessage, ChatSession, MessageRole
-from app.domains.chat.schemas import BotResponse, UIAction
+from app.domains.chat.schemas import BotResponse, UIAction, UIActionType
 from app.domains.chat.tools import TOOL_DEFINITIONS, dispatch
 from app.domains.users.models import User
 
@@ -84,17 +84,19 @@ You help recruiters manage campaigns, upload candidates, and track screening pro
 Rules:
 - NEVER guess or invent UUIDs. Use list_campaigns() to discover IDs.
 - When a resource is not found, call the appropriate list tool first.
-- Keep responses short and professional.
-- When you trigger an action (screening, etc.), always respond with what you did and the batch_id.
-- If you need to show data in the UI, end your response with a JSON block on its own line:
+- Keep responses short, natural, and professional.
+- NEVER output raw internal IDs, batch IDs, or UUIDs (e.g. batch_id, campaign_id, candidate_id, screen_id) in the user-visible text. Refer to entities using their human-readable names or titles (e.g. "Software Developer campaign", "Alice Smith"). Place internal IDs ONLY inside the ACTION JSON payload.
+- If you need to show data or open interactive panels in the UI, end your response with a JSON block on its own line:
   ACTION: {{"type": "UI_ACTION_TYPE", "payload": {{...}}}}
   Valid types:
-    SHOW_CAMPAIGN_LIST      \u2192 list of campaigns (no payload needed)
-    SHOW_CAMPAIGN_DETAIL    \u2192 payload: {{ campaign_id }}
-    SHOW_CANDIDATE_LIST     \u2192 payload: {{ campaign_id }}
-    SHOW_SCREENING_STATUS   \u2192 payload: {{ campaign_id, batch_id }}
-    SHOW_BATCH_STATUS       \u2192 payload: {{ batch_id }}
-    SHOW_CAMPAIGN_PICKER    \u2192 payload: {{ campaigns: [{{id, title}}, ...] }}
+    SHOW_CAMPAIGN_LIST        \u2192 payload: {{ campaigns: [{{id, title, created_at}}, ...] }}
+    SHOW_CAMPAIGN_DETAIL      \u2192 payload: {{ campaign_id, campaign: {{id, title, required_fields, ...}} }}
+    SHOW_CAMPAIGN_CREATE_FORM \u2192 payload: {{ initial_title, initial_text }}
+    SHOW_CANDIDATE_LIST       \u2192 payload: {{ campaign_id, candidates: [{{id, name, email, workflow_step, step_status}}, ...] }}
+    SHOW_CANDIDATE_UPLOAD     \u2192 payload: {{ campaign_id, campaign_title }}
+    SHOW_SCREENING_STATUS     \u2192 payload: {{ campaign_id, batch_id }}
+    SHOW_BATCH_STATUS         \u2192 payload: {{ batch_id }}
+    SHOW_CAMPAIGN_PICKER      \u2192 payload: {{ campaigns: [{{id, title}}, ...] }}
 
 {summary_block}
 """
@@ -131,11 +133,13 @@ def _content_to_dict(content: genai_types.Content) -> dict:
                     "response": part.function_response.response,
                 }
             })
-    return {"role": content.role, "parts": parts}
+    role = "user" if content.role == "tool" else content.role
+    return {"role": role, "parts": parts}
 
 
 def _dict_to_content(data: dict) -> genai_types.Content:
     """Deserialise a stored JSONB dict back to a Gemini Content object."""
+    role = "user" if data.get("role") == "tool" else data.get("role", "user")
     parts = []
     for p in data.get("parts", []):
         if "text" in p:
@@ -156,7 +160,7 @@ def _dict_to_content(data: dict) -> genai_types.Content:
                     response=fr.get("response", {}),
                 )
             ))
-    return genai_types.Content(role=data["role"], parts=parts)
+    return genai_types.Content(role=role, parts=parts)
 
 
 def _extract_text(content: genai_types.Content) -> str | None:
@@ -192,6 +196,42 @@ def _parse_ui_action(text: str) -> tuple[str, UIAction | None]:
     return "\n".join(clean_lines).strip(), action
 
 
+# Keys whose values are large data arrays/objects — strip before persisting.
+_PAYLOAD_DATA_KEYS = frozenset({
+    "candidates", "campaigns", "campaign", "batch_details",
+})
+
+
+def _strip_action_payload_for_storage(text: str) -> str:
+    """
+    Rewrite any ACTION: JSON in *text* so that large data arrays/objects are
+    removed from the payload before the turn is persisted to the DB.
+
+    Only reference keys (ids, type, titles) are kept, so the stored text stays
+    lean and doesn't bloat Gemini's context window on subsequent requests.
+    The live ui_action sent to the frontend is always assembled from fresh
+    tool_results (auto-hydration), so nothing useful is lost.
+    """
+    lines = text.splitlines()
+    out: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("ACTION:"):
+            try:
+                raw = stripped[len("ACTION:"):].strip()
+                data = json.loads(raw)
+                payload = data.get("payload", {})
+                # Remove every key that holds a large data structure
+                slim_payload = {k: v for k, v in payload.items() if k not in _PAYLOAD_DATA_KEYS}
+                data["payload"] = slim_payload
+                out.append("ACTION: " + json.dumps(data, separators=(",", ":")))
+                continue
+            except Exception:
+                pass  # If parsing fails, keep the line as-is
+        out.append(line)
+    return "\n".join(out)
+
+
 # ---------------------------------------------------------------------------
 # History helpers
 # ---------------------------------------------------------------------------
@@ -200,9 +240,12 @@ async def _load_history(
     db: AsyncSession, session_id: UUID
 ) -> list[genai_types.Content]:
     """
-    Load the most recent HISTORY_WINDOW_SIZE *unsummarised* turns from DB and
-    deserialise them into Gemini Content objects ready to be sent as `contents`.
-    Summarised turns are excluded here — they live in ChatSession.summary.
+    Load the most recent HISTORY_WINDOW_SIZE unsummarised text turns from DB and
+    deserialise them into Gemini Content objects.
+
+    Omits intermediate tool-call/response turns from past requests to ensure
+    history is always a valid alternating (user -> model) sequence and to keep
+    token usage low.
     """
     result = await db.execute(
         select(ChatMessage.content)
@@ -211,11 +254,29 @@ async def _load_history(
             ChatMessage.is_summarised.is_(False),
         )
         .order_by(ChatMessage.created_at.desc())
-        .limit(HISTORY_WINDOW_SIZE)
+        .limit(HISTORY_WINDOW_SIZE * 2)
     )
     rows = result.scalars().all()
-    # Reverse so chronological order is oldest → newest
-    return [_dict_to_content(row) for row in reversed(rows)]
+
+    contents: list[genai_types.Content] = []
+    for row in reversed(rows):
+        content = _dict_to_content(row)
+        text = _extract_text(content)
+        if text:
+            # Merge adjacent turns with the same role if any exist in legacy data
+            if contents and contents[-1].role == content.role:
+                prev_text = _extract_text(contents[-1]) or ""
+                contents[-1] = genai_types.Content(
+                    role=content.role,
+                    parts=[genai_types.Part(text=f"{prev_text}\n{text}")],
+                )
+            else:
+                contents.append(genai_types.Content(
+                    role=content.role,
+                    parts=[genai_types.Part(text=text)],
+                ))
+
+    return contents[-HISTORY_WINDOW_SIZE:]
 
 
 async def _persist_turns(
@@ -227,8 +288,18 @@ async def _persist_turns(
     Persist new Content turns to chat_messages in a single flush.
     Increments ChatSession.turn_count atomically.
     """
+    role_map = {"user": MessageRole.USER, "model": MessageRole.MODEL, "tool": MessageRole.TOOL}
     for turn in turns:
-        role_map = {"user": MessageRole.USER, "model": MessageRole.MODEL, "tool": MessageRole.TOOL}
+        # For model turns, strip large data payloads from ACTION blocks so that
+        # candidate/campaign lists don't re-enter Gemini's context window.
+        if turn.role == "model":
+            text = _extract_text(turn)
+            if text and "ACTION:" in text:
+                slim_text = _strip_action_payload_for_storage(text)
+                turn = genai_types.Content(
+                    role=turn.role,
+                    parts=[genai_types.Part(text=slim_text)],
+                )
         db.add(ChatMessage(
             session_id=session_id,
             role=role_map.get(turn.role, MessageRole.MODEL),
@@ -252,16 +323,17 @@ async def _run_agentic_loop(
     system_prompt: str,
     db: AsyncSession,
     user: User,
-) -> genai_types.Content:
+) -> tuple[genai_types.Content, dict[str, Any]]:
     """
     Core agentic loop. Sends history to Gemini, executes tool calls if any,
     and loops until a pure-text response is received or MAX_TOOL_HOPS is hit.
 
-    Returns the final model Content turn.
+    Returns (final model Content turn, dictionary of latest tool results by name).
     """
     tool_config = genai_types.Tool(
         function_declarations=TOOL_DEFINITIONS  # type: ignore[arg-type]
     )
+    tool_results: dict[str, Any] = {}
 
     for hop in range(MAX_TOOL_HOPS):
         response = await asyncio.wait_for(
@@ -292,7 +364,7 @@ async def _run_agentic_loop(
 
         if not tool_calls:
             # No more tool calls — Gemini is done.
-            return model_turn
+            return model_turn, tool_results
 
         # Execute all tool calls (sequential; most responses are tiny)
         response_parts: list[genai_types.Part] = []
@@ -305,6 +377,7 @@ async def _run_agentic_loop(
                 db=db,
                 user=user,
             )
+            tool_results[fc.name] = result
             response_parts.append(genai_types.Part(
                 function_response=genai_types.FunctionResponse(
                     name=fc.name,
@@ -312,11 +385,11 @@ async def _run_agentic_loop(
                 )
             ))
 
-        tool_turn = genai_types.Content(role="tool", parts=response_parts)
+        tool_turn = genai_types.Content(role="user", parts=response_parts)
         history.append(tool_turn)
 
     logger.warning("Chat agentic loop hit MAX_TOOL_HOPS (%d), returning last turn.", MAX_TOOL_HOPS)
-    return history[-2]  # last model turn before the final tool response
+    return history[-2], tool_results
 
 
 # ---------------------------------------------------------------------------
@@ -479,6 +552,7 @@ async def process_message(
 
     # 1. Load sliding-window history from DB
     history = await _load_history(db, session_id)
+    initial_len = len(history)
 
     # 2. Append the new user turn
     user_turn = genai_types.Content(
@@ -492,7 +566,7 @@ async def process_message(
 
     # 4. Run the agentic loop
     client = _get_client()
-    final_model_turn = await _run_agentic_loop(
+    final_model_turn, tool_results = await _run_agentic_loop(
         client=client,
         history=history,
         system_prompt=system_prompt,
@@ -504,10 +578,27 @@ async def process_message(
     raw_text = _extract_text(final_model_turn) or "I'm sorry, I couldn't generate a response."
     clean_text, ui_action = _parse_ui_action(raw_text)
 
+    # Auto-hydrate ui_action payload with fresh tool execution data if missing
+    if ui_action:
+        if ui_action.type == UIActionType.SHOW_CANDIDATE_LIST and "candidates" not in ui_action.payload:
+            if "get_candidates" in tool_results and isinstance(tool_results["get_candidates"], list):
+                ui_action.payload["candidates"] = tool_results["get_candidates"]
+        elif ui_action.type in (UIActionType.SHOW_CAMPAIGN_LIST, UIActionType.SHOW_CAMPAIGN_PICKER) and "campaigns" not in ui_action.payload:
+            if "list_campaigns" in tool_results and isinstance(tool_results["list_campaigns"], list):
+                ui_action.payload["campaigns"] = tool_results["list_campaigns"]
+        elif ui_action.type == UIActionType.SHOW_CAMPAIGN_DETAIL and "campaign" not in ui_action.payload:
+            for tool_key in ("get_campaign", "create_campaign"):
+                if tool_key in tool_results and isinstance(tool_results[tool_key], dict):
+                    ui_action.payload["campaign"] = tool_results[tool_key]
+                    break
+        elif ui_action.type in (UIActionType.SHOW_BATCH_STATUS, UIActionType.SHOW_SCREENING_STATUS) and "batch_details" not in ui_action.payload:
+            for tool_key in ("get_batch_status", "screen_candidates"):
+                if tool_key in tool_results and isinstance(tool_results[tool_key], dict):
+                    ui_action.payload["batch_details"] = tool_results[tool_key]
+                    break
+
     # 6. Persist: user turn + all new model/tool turns (everything appended since load)
-    # history[:original_len] was the window; [original_len:] are the new turns
-    original_len = len(history) - 1  # -1 because user_turn was appended before the loop
-    new_turns = history[original_len:]  # user turn + model/tool turns
+    new_turns = history[initial_len:]
     await _persist_turns(db, session_id, new_turns)
 
     # 7. Maybe summarise in the background (non-blocking — fire and forget)

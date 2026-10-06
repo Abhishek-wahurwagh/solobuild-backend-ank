@@ -29,6 +29,7 @@ from app.domains.campaigns.models import Campaign, Candidate
 from app.domains.campaigns.service import (
     create_batch_tracker,
     enqueue_campaign_screening,
+    extract_document_fields_llm,
     get_batch_status,
 )
 from app.core.redis import get_redis_client
@@ -41,6 +42,41 @@ logger = logging.getLogger(__name__)
 # ===========================================================================
 # Tool Implementation Functions
 # ===========================================================================
+
+async def tool_create_campaign(
+    db: AsyncSession,
+    user: User,
+    title: str,
+    raw_text: str,
+    **_: Any,
+) -> dict:
+    """
+    Create a new recruitment campaign with extracted requirement fields.
+    Takes a title and raw job description/requirements text.
+    """
+    campaign_id = uuid7()
+    try:
+        extracted_fields = await extract_document_fields_llm(raw_text)
+    except Exception:
+        extracted_fields = {}
+
+    campaign = Campaign(
+        id=campaign_id,
+        title=title,
+        raw_text=raw_text,
+        required_fields=extracted_fields,
+        created_by_user_id=user.id,
+    )
+    db.add(campaign)
+    await db.flush()      # flush so the row is visible; commit is the request session's responsibility
+    await db.refresh(campaign)
+
+    return {
+        "id": str(campaign.id),
+        "title": campaign.title,
+        "required_fields": campaign.required_fields or {},
+        "created_at": campaign.created_at.isoformat(),
+    }
 
 async def tool_list_campaigns(
     db: AsyncSession,
@@ -197,6 +233,7 @@ async def tool_get_batch_status(
 # ===========================================================================
 
 _REGISTRY: dict[str, Any] = {
+    "create_campaign": tool_create_campaign,
     "list_campaigns": tool_list_campaigns,
     "get_campaign": tool_get_campaign,
     "get_candidates": tool_get_candidates,
@@ -234,6 +271,27 @@ async def dispatch(
 # ===========================================================================
 
 TOOL_DEFINITIONS = [
+    {
+        "name": "create_campaign",
+        "description": (
+            "Create a new recruitment campaign when the user provides a title and "
+            "job description / requirements text. Automatically extracts structured requirements."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "The title/name of the campaign (e.g. 'Senior Backend Engineer').",
+                },
+                "raw_text": {
+                    "type": "string",
+                    "description": "The job description, responsibilities, or requirements text.",
+                },
+            },
+            "required": ["title", "raw_text"],
+        },
+    },
     {
         "name": "list_campaigns",
         "description": (

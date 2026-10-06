@@ -49,6 +49,7 @@ from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.core.redis import get_redis_client
 from app.core.s3 import download_s3_object, download_s3_prefix, upload_bytes_to_s3
+from app.domains.users.models import User
 from app.domains.campaigns.models import (
     Campaign,
     Candidate,
