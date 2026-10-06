@@ -14,6 +14,7 @@ from app.core.s3 import check_s3_bucket_access
 from app.domains.auth.router import router as auth_router
 from app.domains.agents.router import router as agents_router
 from app.domains.campaigns.router import router as campaigns_router
+from app.domains.chat.router import router as chat_router
 from app.domains.telephony.router import router as telephony_router
 from app.domains.users.router import router as users_router
 """
@@ -74,6 +75,7 @@ app.add_middleware(
 app.include_router(auth_router, prefix="/api/v1", tags=["Auth"])
 app.include_router(agents_router, prefix="/api/v1", tags=["Agents"])
 app.include_router(campaigns_router, prefix="/api/v1", tags=["Campaigns"])
+app.include_router(chat_router, prefix="/api/v1", tags=["Chat"])
 app.include_router(telephony_router, prefix="/api/v1", tags=["Telephony"])
 app.include_router(users_router, prefix="/api/v1", tags=["Users"])
 """
