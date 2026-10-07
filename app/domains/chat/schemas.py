@@ -25,6 +25,10 @@ class UIActionType(str, enum.Enum):
     SHOW_SCREENING_STATUS = "SHOW_SCREENING_STATUS" # renders BatchStatusPanel (screening)
     SHOW_BATCH_STATUS     = "SHOW_BATCH_STATUS"     # renders BatchStatusPanel (generic)
 
+    # Screening result views
+    SHOW_SCREENING_RESULTS = "SHOW_SCREENING_RESULTS"
+    SHOW_CANDIDATE_SCREENING_RESULT = "SHOW_CANDIDATE_SCREENING_RESULT"
+
     # Disambiguation
     SHOW_CAMPAIGN_PICKER  = "SHOW_CAMPAIGN_PICKER"  # renders CampaignSelectorCard
 
@@ -53,6 +57,7 @@ class ChatMessageResponse(BaseModel):
     role: str
     # We only surface text content to the client, not raw Gemini parts.
     text: str | None = None
+    ui_action: UIAction | None = None
     created_at: datetime
     model_config = ConfigDict(from_attributes=True)
 

@@ -328,7 +328,12 @@ async def upload_candidates(
 
     redis = await get_redis_client()
     try:
-        await create_batch_tracker(redis, batch_id, file_count=len(staged_files))
+        await create_batch_tracker(
+            redis,
+            batch_id,
+            file_count=len(staged_files),
+            campaign_id=str(campaign_id),
+        )
         await enqueue_document_upload_batch(
             redis,
             batch_id=batch_id,
@@ -409,7 +414,12 @@ async def retry_failed_upload(
 
     redis = await get_redis_client()
     try:
-        await create_batch_tracker(redis, batch_id, file_count=len(retry_items))
+        await create_batch_tracker(
+            redis,
+            batch_id,
+            file_count=len(retry_items),
+            campaign_id=str(campaign_id),
+        )
         await enqueue_document_upload_batch(
             redis,
             batch_id=batch_id,
@@ -454,6 +464,8 @@ async def batch_status(
         await redis.aclose()
 
     if data is None:
+        raise HTTPException(status_code=404, detail="Batch not found.")
+    if data.get("campaign_id") not in (None, str(campaign_id)):
         raise HTTPException(status_code=404, detail="Batch not found.")
 
     status_val = data.get("status", "UNKNOWN")
@@ -656,19 +668,38 @@ async def screen_candidates(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    result = await db.execute(
-        select(Campaign).where(
+    campaign_result = await db.execute(
+        select(Campaign.id).where(
             Campaign.id == campaign_id,
             Campaign.created_by_user_id == current_user.id,
         )
     )
-    if not result.scalar_one_or_none():
+    if campaign_result.scalar_one_or_none() is None:
         raise HTTPException(status_code=404, detail="Campaign not found.")
+
+    if candidate_ids:
+        candidate_result = await db.execute(
+            select(Candidate.id).where(
+                Candidate.campaign_id == campaign_id,
+                Candidate.id.in_(candidate_ids),
+            )
+        )
+        owned_candidate_ids = set(candidate_result.scalars().all())
+        if owned_candidate_ids != set(candidate_ids):
+            raise HTTPException(
+                status_code=404,
+                detail="One or more candidates were not found in this campaign.",
+            )
 
     batch_id = f"screen_{uuid7()}"
     redis = await get_redis_client()
     try:
-        await create_batch_tracker(redis, batch_id, file_count=0)
+        await create_batch_tracker(
+            redis,
+            batch_id,
+            file_count=0,
+            campaign_id=str(campaign_id),
+        )
         candidate_ids_str = [str(cid) for cid in candidate_ids] if candidate_ids else None
 
         await enqueue_campaign_screening(
@@ -692,8 +723,18 @@ async def screen_candidates(
 async def screening_batch_status(
     campaign_id: UUID,
     batch_id: str,
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    campaign_result = await db.execute(
+        select(Campaign.id).where(
+            Campaign.id == campaign_id,
+            Campaign.created_by_user_id == current_user.id,
+        )
+    )
+    if campaign_result.scalar_one_or_none() is None:
+        raise HTTPException(status_code=404, detail="Campaign not found.")
+
     redis = await get_redis_client()
     try:
         data = await get_batch_status(redis, batch_id)
@@ -701,6 +742,8 @@ async def screening_batch_status(
         await redis.aclose()
 
     if data is None:
+        raise HTTPException(status_code=404, detail="Batch not found.")
+    if data.get("campaign_id") not in (None, str(campaign_id)):
         raise HTTPException(status_code=404, detail="Batch not found.")
 
     return BatchStatusResponse(
@@ -752,7 +795,12 @@ async def call_candidates(
     batch_id = f"call_{uuid7()}"
     redis = await get_redis_client()
     try:
-        await create_batch_tracker(redis, batch_id, file_count=len(candidates))
+        await create_batch_tracker(
+            redis,
+            batch_id,
+            file_count=len(candidates),
+            campaign_id=str(campaign_id),
+        )
         candidate_ids_str = (
             [str(c.id) for c in candidates]
             if request.candidate_ids is not None

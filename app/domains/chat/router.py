@@ -7,6 +7,7 @@ standard HTTP status codes).
 """
 from uuid import UUID
 
+from google.genai.errors import ServerError
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -116,6 +117,11 @@ async def send_message(
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    except ServerError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="The AI service is temporarily unavailable. Please try again shortly.",
+        ) from exc
     except RuntimeError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -134,7 +140,7 @@ async def get_messages(
 ):
     """
     Fetch the stored message history for a session.
-    Returns simplified {role, text} objects suitable for rendering a chat UI.
+    Returns text and structured UI actions suitable for restoring a chat UI.
     """
     messages = await chat_service.get_session_messages(db, session_id, current_user)
     if not messages and not await chat_service.get_session(db, session_id, current_user):
@@ -146,5 +152,15 @@ async def get_messages(
         text = next((p["text"] for p in parts if "text" in p), None)
         # Only surface user and model text turns to the client
         if msg.role.value in ("user", "model") and text:
-            result.append({"role": msg.role.value, "text": text})
+            item = {"role": msg.role.value, "text": text}
+            ui_action = msg.content.get("ui_action")
+            if isinstance(ui_action, dict):
+                item["ui_action"] = ui_action
+            elif msg.role.value == "model":
+                # Legacy messages stored the display instruction inside prose.
+                clean_text, legacy_action = chat_service._parse_ui_action(text)
+                item["text"] = clean_text
+                if legacy_action is not None:
+                    item["ui_action"] = legacy_action.model_dump(mode="json")
+            result.append(item)
     return result

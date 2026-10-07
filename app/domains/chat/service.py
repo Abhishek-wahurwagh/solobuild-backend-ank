@@ -29,10 +29,11 @@ from uuid import UUID
 
 from google import genai
 from google.genai import types as genai_types
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.database import AsyncSessionLocal
 from app.domains.chat.models import ChatMessage, ChatSession, MessageRole
 from app.domains.chat.schemas import BotResponse, UIAction, UIActionType
 from app.domains.chat.tools import TOOL_DEFINITIONS, dispatch
@@ -78,25 +79,23 @@ def _get_client() -> genai.Client:
 # ---------------------------------------------------------------------------
 
 _SYSTEM_PROMPT_TEMPLATE = """\
-You are a helpful AI assistant embedded in a recruitment platform called SoloBuild.
-You help recruiters manage campaigns, upload candidates, and track screening progress.
+You are the receptionist for the recruitment workspace called SoloBuild.
+Your role is to understand the recruiter's intent, perform supported backend actions,
+and direct the frontend to the existing campaign or candidate interface for the task.
 
 Rules:
-- NEVER guess or invent UUIDs. Use list_campaigns() to discover IDs.
-- When a resource is not found, call the appropriate list tool first.
-- Keep responses short, natural, and professional.
-- NEVER output raw internal IDs, batch IDs, or UUIDs (e.g. batch_id, campaign_id, candidate_id, screen_id) in the user-visible text. Refer to entities using their human-readable names or titles (e.g. "Software Developer campaign", "Alice Smith"). Place internal IDs ONLY inside the ACTION JSON payload.
-- If you need to show data or open interactive panels in the UI, end your response with a JSON block on its own line:
-  ACTION: {{"type": "UI_ACTION_TYPE", "payload": {{...}}}}
-  Valid types:
-    SHOW_CAMPAIGN_LIST        \u2192 payload: {{ campaigns: [{{id, title, created_at}}, ...] }}
-    SHOW_CAMPAIGN_DETAIL      \u2192 payload: {{ campaign_id, campaign: {{id, title, required_fields, ...}} }}
-    SHOW_CAMPAIGN_CREATE_FORM \u2192 payload: {{ initial_title, initial_text }}
-    SHOW_CANDIDATE_LIST       \u2192 payload: {{ campaign_id, candidates: [{{id, name, email, workflow_step, step_status}}, ...] }}
-    SHOW_CANDIDATE_UPLOAD     \u2192 payload: {{ campaign_id, campaign_title }}
-    SHOW_SCREENING_STATUS     \u2192 payload: {{ campaign_id, batch_id }}
-    SHOW_BATCH_STATUS         \u2192 payload: {{ batch_id }}
-    SHOW_CAMPAIGN_PICKER      \u2192 payload: {{ campaigns: [{{id, title}}, ...] }}
+- Treat tool results as the source of truth. Tool errors mean the action failed; say so plainly and do not describe it as successful.
+- Never infer a score, screening completion, candidate identity, campaign assignment, or result that is absent from tool output.
+- Never expose internal IDs, batch IDs, or UUIDs in user-visible text. The frontend action protocol handles IDs separately.
+- Resolve campaign names with list_campaigns, then get_campaign for the chosen campaign. If more than one campaign plausibly matches, ask the user to choose with present_ui(SHOW_CAMPAIGN_PICKER); do not choose arbitrarily.
+- Resolve candidate names with find_candidates in the selected campaign. If there is no match, say so. If multiple candidates match, present the matches via the relevant candidate UI or ask a concise clarifying question; never act on one arbitrarily.
+- Campaign creation and file upload require user interaction. Do not claim creation/upload happened before the user completes the UI form.
+- Screening is a mutating operation you may perform. For a named candidate, resolve exactly one candidate first and pass that candidate ID to screen_candidates. For an explicit whole-campaign request, omit candidate_ids. Do not silently screen an entire campaign when the user named one candidate.
+- screen_candidates only queues work. After it succeeds, say screening was queued/started (not completed) and show its batch progress using the returned batch_id. Only describe screening results after get_document_screenings or get_candidate_document_screenings returns persisted rows. An empty result means "not screened yet"/"no result available", not incompatible.
+- Use list_agents when asked to assign/change the AI recruiter. Resolve exactly one campaign and one available agent, then call update_campaign_agent. Report success only after that tool succeeds.
+- Use tools to obtain facts for answers and use present_ui to request an interface. present_ui is not a business action: call it only after the relevant tool succeeds. Its action must use the exact IDs returned by those tools. For a greeting or general question, do not open a panel.
+- Do not print ACTION blocks or JSON in normal assistant text. Call present_ui as a function tool; the server returns its validated action separately.
+- Use compact, human-friendly wording. Avoid repeating boilerplate or narrating every internal tool call. Ask one short clarification when required to proceed safely.
 
 {summary_block}
 """
@@ -176,60 +175,146 @@ def _parse_ui_action(text: str) -> tuple[str, UIAction | None]:
     Detect and strip an ACTION line from the model's text response.
     Returns (clean_text, UIAction | None).
     """
-    lines = text.splitlines()
-    action: UIAction | None = None
-    clean_lines = []
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("ACTION:"):
-            try:
-                raw = stripped[len("ACTION:"):].strip()
-                data = json.loads(raw)
-                action = UIAction(
-                    type=data.get("type", ""),
-                    payload=data.get("payload", {}),
-                )
-            except (json.JSONDecodeError, Exception):
-                clean_lines.append(line)
-        else:
-            clean_lines.append(line)
-    return "\n".join(clean_lines).strip(), action
+    marker_index = text.rfind("ACTION:")
+    if marker_index < 0:
+        return text.strip(), None
+    try:
+        data = json.loads(text[marker_index + len("ACTION:"):].strip())
+        if not isinstance(data, dict):
+            return text.strip(), None
+        action = UIAction.model_validate(data)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return text.strip(), None
+    return text[:marker_index].rstrip(), action
 
 
-# Keys whose values are large data arrays/objects — strip before persisting.
-_PAYLOAD_DATA_KEYS = frozenset({
-    "candidates", "campaigns", "campaign", "batch_details",
-})
+def _validate_ui_action(
+    action_data: dict[str, Any],
+    tool_results: dict[str, Any],
+) -> tuple[UIAction | None, str | None]:
+    """Validate display instructions against successful tool results for this turn."""
+    try:
+        action = UIAction.model_validate(action_data)
+    except (TypeError, ValueError):
+        return None, "The UI action type or payload was invalid."
 
+    payload = action.payload
+    campaign_id = payload.get("campaign_id")
+    candidate_id = payload.get("candidate_id")
+    batch_id = payload.get("batch_id")
 
-def _strip_action_payload_for_storage(text: str) -> str:
-    """
-    Rewrite any ACTION: JSON in *text* so that large data arrays/objects are
-    removed from the payload before the turn is persisted to the DB.
+    def result(name: str) -> Any:
+        value = tool_results.get(name)
+        if isinstance(value, dict) and value.get("error"):
+            return None
+        return value
 
-    Only reference keys (ids, type, titles) are kept, so the stored text stays
-    lean and doesn't bloat Gemini's context window on subsequent requests.
-    The live ui_action sent to the frontend is always assembled from fresh
-    tool_results (auto-hydration), so nothing useful is lost.
-    """
-    lines = text.splitlines()
-    out: list[str] = []
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("ACTION:"):
-            try:
-                raw = stripped[len("ACTION:"):].strip()
-                data = json.loads(raw)
-                payload = data.get("payload", {})
-                # Remove every key that holds a large data structure
-                slim_payload = {k: v for k, v in payload.items() if k not in _PAYLOAD_DATA_KEYS}
-                data["payload"] = slim_payload
-                out.append("ACTION: " + json.dumps(data, separators=(",", ":")))
-                continue
-            except Exception:
-                pass  # If parsing fails, keep the line as-is
-        out.append(line)
-    return "\n".join(out)
+    def campaign_matches(*names: str) -> bool:
+        return any(
+            isinstance(result(name), dict)
+            and (
+                result(name).get("campaign_id") == campaign_id
+                or name == "get_campaign" and result(name).get("id") == campaign_id
+            )
+            for name in names
+        )
+
+    campaign_detail = result("get_campaign")
+    candidate_screenings = result("get_candidate_document_screenings")
+    requirements: dict[UIActionType, tuple[bool, str]] = {
+        UIActionType.SHOW_CAMPAIGN_LIST: (
+            isinstance(result("list_campaigns"), list),
+            "Load campaigns before showing the campaign list.",
+        ),
+        UIActionType.SHOW_CAMPAIGN_PICKER: (
+            isinstance(result("list_campaigns"), list),
+            "Load campaigns before asking the user to choose one.",
+        ),
+        UIActionType.SHOW_CAMPAIGN_CREATE_FORM: (True, ""),
+        UIActionType.SHOW_CAMPAIGN_DETAIL: (
+            bool(campaign_id) and (
+                isinstance(campaign_detail, dict) and campaign_detail.get("id") == campaign_id
+                or campaign_matches("get_candidates", "get_document_screenings", "update_campaign_agent")
+            ),
+            "Resolve the requested campaign with a successful campaign tool before opening it.",
+        ),
+        UIActionType.SHOW_CANDIDATE_UPLOAD: (
+            bool(campaign_id) and campaign_matches("get_campaign", "get_candidates"),
+            "Resolve the requested campaign before opening its upload interface.",
+        ),
+        UIActionType.SHOW_CANDIDATE_LIST: (
+            bool(campaign_id) and campaign_matches("get_candidates"),
+            "Load candidates for the requested campaign before showing the candidate list.",
+        ),
+        UIActionType.SHOW_SCREENING_RESULTS: (
+            bool(campaign_id) and campaign_matches("get_document_screenings"),
+            "Load screening results for the requested campaign before showing them.",
+        ),
+        UIActionType.SHOW_CANDIDATE_SCREENING_RESULT: (
+            bool(campaign_id and candidate_id)
+            and isinstance(candidate_screenings, dict)
+            and candidate_screenings.get("campaign_id") == campaign_id
+            and isinstance(candidate_screenings.get("candidate"), dict)
+            and candidate_screenings["candidate"].get("id") == candidate_id,
+            "Resolve this candidate's screening record before opening the report.",
+        ),
+        UIActionType.SHOW_SCREENING_STATUS: (
+            bool(campaign_id and batch_id) and any(
+                isinstance(result(name), dict)
+                and result(name).get("campaign_id") == campaign_id
+                and result(name).get("batch_id") == batch_id
+                for name in ("screen_candidates", "get_batch_status")
+            ),
+            "Start or resolve the screening batch before showing its status.",
+        ),
+        UIActionType.SHOW_BATCH_STATUS: (
+            bool(campaign_id and batch_id) and any(
+                isinstance(result(name), dict)
+                and result(name).get("campaign_id") == campaign_id
+                and result(name).get("batch_id") == batch_id
+                for name in ("screen_candidates", "get_batch_status")
+            ),
+            "Start or resolve the batch before showing its status.",
+        ),
+    }
+    valid, reason = requirements[action.type]
+    if not valid:
+        return None, reason
+
+    required_fields: dict[UIActionType, tuple[str, ...]] = {
+        UIActionType.SHOW_CAMPAIGN_LIST: (),
+        UIActionType.SHOW_CAMPAIGN_PICKER: (),
+        UIActionType.SHOW_CAMPAIGN_CREATE_FORM: (),
+        UIActionType.SHOW_CAMPAIGN_DETAIL: ("campaign_id",),
+        UIActionType.SHOW_CANDIDATE_UPLOAD: ("campaign_id",),
+        UIActionType.SHOW_CANDIDATE_LIST: ("campaign_id",),
+        UIActionType.SHOW_SCREENING_RESULTS: ("campaign_id",),
+        UIActionType.SHOW_CANDIDATE_SCREENING_RESULT: ("campaign_id", "candidate_id"),
+        UIActionType.SHOW_SCREENING_STATUS: ("campaign_id", "batch_id"),
+        UIActionType.SHOW_BATCH_STATUS: ("campaign_id", "batch_id"),
+    }
+    for key in required_fields[action.type]:
+        if not isinstance(payload.get(key), str) or not payload[key]:
+            return None, f"The UI action is missing required field {key}."
+
+    allowed_payload_fields: dict[UIActionType, tuple[str, ...]] = {
+        UIActionType.SHOW_CAMPAIGN_LIST: (),
+        UIActionType.SHOW_CAMPAIGN_PICKER: ("reason",),
+        UIActionType.SHOW_CAMPAIGN_CREATE_FORM: ("initial_title", "initial_text"),
+        UIActionType.SHOW_CAMPAIGN_DETAIL: ("campaign_id",),
+        UIActionType.SHOW_CANDIDATE_UPLOAD: ("campaign_id", "campaign_title"),
+        UIActionType.SHOW_CANDIDATE_LIST: ("campaign_id",),
+        UIActionType.SHOW_SCREENING_RESULTS: ("campaign_id",),
+        UIActionType.SHOW_CANDIDATE_SCREENING_RESULT: ("campaign_id", "candidate_id"),
+        UIActionType.SHOW_SCREENING_STATUS: ("campaign_id", "batch_id"),
+        UIActionType.SHOW_BATCH_STATUS: ("campaign_id", "batch_id", "batch_type"),
+    }
+    safe_payload = {
+        key: value
+        for key, value in payload.items()
+        if key in allowed_payload_fields[action.type]
+    }
+    return UIAction(type=action.type, payload=safe_payload), None
 
 
 # ---------------------------------------------------------------------------
@@ -283,27 +368,39 @@ async def _persist_turns(
     db: AsyncSession,
     session_id: UUID,
     turns: list[genai_types.Content],
+    ui_action: UIAction | None = None,
 ) -> None:
     """
     Persist new Content turns to chat_messages in a single flush.
     Increments ChatSession.turn_count atomically.
     """
     role_map = {"user": MessageRole.USER, "model": MessageRole.MODEL, "tool": MessageRole.TOOL}
-    for turn in turns:
-        # For model turns, strip large data payloads from ACTION blocks so that
-        # candidate/campaign lists don't re-enter Gemini's context window.
+    last_text_turn_index = next(
+        (
+            index
+            for index in range(len(turns) - 1, -1, -1)
+            if turns[index].role == "model" and _extract_text(turns[index])
+        ),
+        None,
+    )
+    for index, turn in enumerate(turns):
+        content = _content_to_dict(turn)
         if turn.role == "model":
             text = _extract_text(turn)
             if text and "ACTION:" in text:
-                slim_text = _strip_action_payload_for_storage(text)
-                turn = genai_types.Content(
+                text, legacy_action = _parse_ui_action(text)
+                if ui_action is None:
+                    ui_action = legacy_action
+                content = _content_to_dict(genai_types.Content(
                     role=turn.role,
-                    parts=[genai_types.Part(text=slim_text)],
-                )
+                    parts=[genai_types.Part(text=text)],
+                ))
+            if ui_action is not None and index == last_text_turn_index and text:
+                content["ui_action"] = ui_action.model_dump(mode="json")
         db.add(ChatMessage(
             session_id=session_id,
             role=role_map.get(turn.role, MessageRole.MODEL),
-            content=_content_to_dict(turn),
+            content=content,
         ))
 
     # Increment turn_count without a SELECT
@@ -323,19 +420,22 @@ async def _run_agentic_loop(
     system_prompt: str,
     db: AsyncSession,
     user: User,
-) -> tuple[genai_types.Content, dict[str, Any]]:
+) -> tuple[genai_types.Content, dict[str, Any], UIAction | None]:
     """
     Core agentic loop. Sends history to Gemini, executes tool calls if any,
     and loops until a pure-text response is received or MAX_TOOL_HOPS is hit.
 
-    Returns (final model Content turn, dictionary of latest tool results by name).
+    Returns the final model turn, latest results by tool name, and a validated
+    frontend action requested through the dedicated presentation tool.
     """
     tool_config = genai_types.Tool(
         function_declarations=TOOL_DEFINITIONS  # type: ignore[arg-type]
     )
     tool_results: dict[str, Any] = {}
+    ui_action: UIAction | None = None
+    last_model_turn: genai_types.Content | None = None
 
-    for hop in range(MAX_TOOL_HOPS):
+    for _ in range(MAX_TOOL_HOPS):
         response = await asyncio.wait_for(
             client.aio.models.generate_content(
                 model=CHAT_MODEL,
@@ -355,6 +455,7 @@ async def _run_agentic_loop(
         )
 
         model_turn = response.candidates[0].content
+        last_model_turn = model_turn
         history.append(model_turn)
 
         # Collect any function calls in this turn
@@ -364,13 +465,17 @@ async def _run_agentic_loop(
 
         if not tool_calls:
             # No more tool calls — Gemini is done.
-            return model_turn, tool_results
+            return model_turn, tool_results, ui_action
 
         # Execute all tool calls (sequential; most responses are tiny)
         response_parts: list[genai_types.Part] = []
+        requested_ui_actions: list[dict[str, Any]] = []
         for tc in tool_calls:
             fc = tc.function_call
             logger.debug("Chat tool call: %s(%s)", fc.name, fc.args)
+            if fc.name == "present_ui":
+                requested_ui_actions.append(dict(fc.args or {}))
+                continue
             result = await dispatch(
                 name=fc.name,
                 args=dict(fc.args or {}),
@@ -385,59 +490,93 @@ async def _run_agentic_loop(
                 )
             ))
 
+        for action_data in requested_ui_actions:
+            validated_action, error = _validate_ui_action(action_data, tool_results)
+            if validated_action is not None:
+                ui_action = validated_action
+                response_parts.append(genai_types.Part(
+                    function_response=genai_types.FunctionResponse(
+                        name="present_ui",
+                        response={"result": {"accepted": True}},
+                    )
+                ))
+            else:
+                response_parts.append(genai_types.Part(
+                    function_response=genai_types.FunctionResponse(
+                        name="present_ui",
+                        response={"result": {"error": error}},
+                    )
+                ))
+
         tool_turn = genai_types.Content(role="user", parts=response_parts)
         history.append(tool_turn)
 
-    logger.warning("Chat agentic loop hit MAX_TOOL_HOPS (%d), returning last turn.", MAX_TOOL_HOPS)
-    return history[-2], tool_results
+    logger.warning("Chat agentic loop hit MAX_TOOL_HOPS (%d).", MAX_TOOL_HOPS)
+    if last_model_turn is None:
+        raise RuntimeError("Chat agentic loop ended without a model response.")
+    fallback_turn = genai_types.Content(
+        role="model",
+        parts=[genai_types.Part(
+            text="I couldn't finish preparing the response. Please try that request again."
+        )],
+    )
+    history.append(fallback_turn)
+    return fallback_turn, tool_results, ui_action
 
 
 # ---------------------------------------------------------------------------
 # Summarisation
 # ---------------------------------------------------------------------------
 
-async def _maybe_summarise(db: AsyncSession, session: ChatSession) -> None:
+async def _maybe_summarise(session_id: UUID) -> None:
     """
-    If the session has accumulated enough turns, compress the oldest half into
-    `ChatSession.summary` and delete those rows from `chat_messages`.
+    If the session has accumulated enough turns, compress old messages into
+    `ChatSession.summary` and mark those rows as summarised.
 
-    This keeps the sliding window meaningful while bounding long-term storage.
-    Runs in-process (no background task) after the response is sent, so it
-    does not block the user.
+    Database sessions are kept out of the Gemini request so a slow provider
+    response cannot hold a database connection and transaction open.
     """
-    if (session.turn_count or 0) < SUMMARISE_AFTER_TURNS:
-        return
-
-    # Load the oldest turns (everything outside the current window)
-    evict_count = session.turn_count - HISTORY_WINDOW_SIZE
-    if evict_count <= 0:
-        return
-
-    result = await db.execute(
-        select(ChatMessage)
-        .where(ChatMessage.session_id == session.id)
-        .order_by(ChatMessage.created_at.asc())
-        .limit(evict_count)
-    )
-    old_messages = result.scalars().all()
-    if not old_messages:
-        return
-
-    # Build a plain-text representation for Gemini to summarise
-    lines: list[str] = []
-    for msg in old_messages:
-        role = msg.role.value
-        text = msg.content.get("parts", [{}])[0].get("text", "[tool interaction]")
-        lines.append(f"{role}: {text[:300]}")  # truncate per-line to keep prompt small
-    transcript = "\n".join(lines)
-
-    prompt = (
-        "Summarise the following conversation turns concisely for future context. "
-        "Focus on entities (campaign names/IDs, candidate counts, batch IDs, actions taken). "
-        "Max 200 words.\n\n" + transcript
-    )
-
     try:
+        async with AsyncSessionLocal() as db:
+            session = await db.get(ChatSession, session_id)
+            if session is None or (session.turn_count or 0) < SUMMARISE_AFTER_TURNS:
+                return
+
+            evict_count = session.turn_count - HISTORY_WINDOW_SIZE
+            if evict_count <= 0:
+                return
+
+            result = await db.execute(
+                select(ChatMessage)
+                .where(
+                    ChatMessage.session_id == session_id,
+                    ChatMessage.is_summarised.is_(False),
+                )
+                .order_by(ChatMessage.created_at.asc())
+                .limit(evict_count)
+            )
+            old_messages = result.scalars().all()
+            if not old_messages:
+                return
+
+            old_message_ids = [message.id for message in old_messages]
+            previous_summary = session.summary or ""
+            lines: list[str] = []
+            for msg in old_messages:
+                role = msg.role.value
+                text = msg.content.get("parts", [{}])[0].get("text", "[tool interaction]")
+                lines.append(f"{role}: {text[:300]}")
+            transcript = "\n".join(lines)
+
+        prompt = (
+            "Create an updated, cumulative conversation summary for future context. "
+            "Combine the previous summary with the newly archived messages, preserving "
+            "important entities, user preferences, decisions, and actions taken. "
+            "Keep the complete updated summary to at most 200 words.\n\n"
+            f"Previous summary:\n{previous_summary or '(none)'}\n\n"
+            f"Newly archived messages:\n{transcript}"
+        )
+
         client = _get_client()
         summary_response = await asyncio.wait_for(
             client.aio.models.generate_content(
@@ -447,24 +586,63 @@ async def _maybe_summarise(db: AsyncSession, session: ChatSession) -> None:
             ),
             timeout=30,
         )
-        new_summary_text = summary_response.text or ""
-        # Prepend to any existing summary so context accumulates
-        existing = session.summary or ""
-        session.summary = (existing + "\n\n" + new_summary_text).strip()
-    except Exception:
-        logger.exception("Chat summarisation failed for session %s", session.id)
-        return
+        new_summary_text = (summary_response.text or "").strip()
+        if not new_summary_text:
+            logger.warning("Chat summarisation returned empty text for session %s", session_id)
+            return
+        summary_words = new_summary_text.split()
+        if len(summary_words) > 200:
+            logger.warning(
+                "Chat summary exceeded 200 words for session %s; truncating.",
+                session_id,
+            )
+            new_summary_text = " ".join(summary_words[:200])
 
-    # Mark evicted rows as summarised — they stay in DB for audit/history.
-    ids_to_mark = [m.id for m in old_messages]
-    await db.execute(
-        update(ChatMessage)
-        .where(ChatMessage.id.in_(ids_to_mark))
-        .values(is_summarised=True)
-    )
-    # turn_count now tracks only the unsummarised (live) window
-    session.turn_count = session.turn_count - evict_count
-    await db.flush()
+        async with AsyncSessionLocal() as db:
+            # Mark only rows still eligible for summarisation, so overlapping
+            # background tasks cannot decrement the live turn count twice.
+            marked = await db.execute(
+                update(ChatMessage)
+                .where(
+                    ChatMessage.id.in_(old_message_ids),
+                    ChatMessage.is_summarised.is_(False),
+                )
+                .values(is_summarised=True)
+                .returning(ChatMessage.id)
+            )
+            marked_count = len(marked.scalars().all())
+            if not marked_count:
+                return
+
+            await db.execute(
+                update(ChatSession)
+                .where(ChatSession.id == session_id)
+                .values(
+                    summary=new_summary_text,
+                    turn_count=func.greatest(ChatSession.turn_count - marked_count, 0),
+                )
+                .execution_options(synchronize_session=False)
+            )
+            await db.commit()
+    except TimeoutError:
+        logger.warning(
+            "Chat summarisation timed out for session %s; archived messages remain "
+            "eligible for a later retry.",
+            session_id,
+        )
+    except Exception:
+        logger.exception("Chat summarisation failed for session %s", session_id)
+
+
+def _log_background_task_exception(task: asyncio.Task[Any]) -> None:
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        logger.error(
+            "Unexpected chat background task failure",
+            exc_info=(type(error), error, error.__traceback__),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -566,7 +744,7 @@ async def process_message(
 
     # 4. Run the agentic loop
     client = _get_client()
-    final_model_turn, tool_results = await _run_agentic_loop(
+    final_model_turn, tool_results, ui_action = await _run_agentic_loop(
         client=client,
         history=history,
         system_prompt=system_prompt,
@@ -576,32 +754,30 @@ async def process_message(
 
     # 5. Extract text + optional UI action
     raw_text = _extract_text(final_model_turn) or "I'm sorry, I couldn't generate a response."
-    clean_text, ui_action = _parse_ui_action(raw_text)
-
-    # Auto-hydrate ui_action payload with fresh tool execution data if missing
-    if ui_action:
-        if ui_action.type == UIActionType.SHOW_CANDIDATE_LIST and "candidates" not in ui_action.payload:
-            if "get_candidates" in tool_results and isinstance(tool_results["get_candidates"], list):
-                ui_action.payload["candidates"] = tool_results["get_candidates"]
-        elif ui_action.type in (UIActionType.SHOW_CAMPAIGN_LIST, UIActionType.SHOW_CAMPAIGN_PICKER) and "campaigns" not in ui_action.payload:
-            if "list_campaigns" in tool_results and isinstance(tool_results["list_campaigns"], list):
-                ui_action.payload["campaigns"] = tool_results["list_campaigns"]
-        elif ui_action.type == UIActionType.SHOW_CAMPAIGN_DETAIL and "campaign" not in ui_action.payload:
-            for tool_key in ("get_campaign", "create_campaign"):
-                if tool_key in tool_results and isinstance(tool_results[tool_key], dict):
-                    ui_action.payload["campaign"] = tool_results[tool_key]
-                    break
-        elif ui_action.type in (UIActionType.SHOW_BATCH_STATUS, UIActionType.SHOW_SCREENING_STATUS) and "batch_details" not in ui_action.payload:
-            for tool_key in ("get_batch_status", "screen_candidates"):
-                if tool_key in tool_results and isinstance(tool_results[tool_key], dict):
-                    ui_action.payload["batch_details"] = tool_results[tool_key]
-                    break
+    if _extract_text(final_model_turn) is None:
+        final_model_turn = genai_types.Content(
+            role="model",
+            parts=[genai_types.Part(text=raw_text)],
+        )
+        history.append(final_model_turn)
+    clean_text, legacy_action = _parse_ui_action(raw_text)
+    clean_text = clean_text or "I couldn't prepare a response for that request."
+    if ui_action is None and legacy_action is not None:
+        ui_action, _ = _validate_ui_action(
+            legacy_action.model_dump(mode="python"),
+            tool_results,
+        )
 
     # 6. Persist: user turn + all new model/tool turns (everything appended since load)
     new_turns = history[initial_len:]
-    await _persist_turns(db, session_id, new_turns)
+    await _persist_turns(db, session_id, new_turns, ui_action=ui_action)
 
-    # 7. Maybe summarise in the background (non-blocking — fire and forget)
-    asyncio.create_task(_maybe_summarise(db, session))  # type: ignore[arg-type]
+    # Ensure the background task can observe these turns using its own session.
+    await db.commit()
+
+    # 7. Maybe summarise in the background (non-blocking — fire and forget).
+    if (session.turn_count or 0) >= SUMMARISE_AFTER_TURNS:
+        task = asyncio.create_task(_maybe_summarise(session_id))
+        task.add_done_callback(_log_background_task_exception)
 
     return BotResponse(text=clean_text, ui_action=ui_action)

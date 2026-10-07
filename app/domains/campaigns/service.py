@@ -263,23 +263,31 @@ CALL_PAUSE_KEY = "campaign:{campaign_id}:pause"
 _BATCH_TTL = 7 * 86400  # 7 days
 
 
-async def create_batch_tracker(redis: Redis, batch_id: str, file_count: int) -> None:
+async def create_batch_tracker(
+    redis: Redis,
+    batch_id: str,
+    file_count: int,
+    campaign_id: str | None = None,
+) -> None:
     now = datetime.now(timezone.utc).isoformat()
     await redis.delete(
         f"job:{batch_id}",
         _BATCH_PENDING_KEY.format(batch_id=batch_id),
         f"job:{batch_id}:adjustments",
     )
+    batch_data = {
+        "status": "QUEUED",
+        "total_candidates": str(file_count),
+        "processed": "0",
+        "failed": "0",
+        "created_at": now,
+        "updated_at": now,
+    }
+    if campaign_id is not None:
+        batch_data["campaign_id"] = campaign_id
     await redis.hset(  # type: ignore
         f"job:{batch_id}",
-        mapping={
-            "status": "QUEUED",
-            "total_candidates": str(file_count),
-            "processed": "0",
-            "failed": "0",
-            "created_at": now,
-            "updated_at": now,
-        },
+        mapping=batch_data,
     )
     await redis.expire(f"job:{batch_id}", _BATCH_TTL)
 
